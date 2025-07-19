@@ -1,11 +1,14 @@
 #include <string_view>
 #include <vector>
 
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/from_chars.hpp"
 #include "cowel/util/strings.hpp"
 #include "cowel/util/to_chars.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
+#include "cowel/directive_arguments.hpp"
 #include "cowel/directive_processing.hpp"
 
 namespace cowel {
@@ -31,16 +34,17 @@ long long operate(Expression_Type type, long long x, long long y)
 
 } // namespace
 
-void Expression_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
+Content_Status
+Expression_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context)
+    const
 {
     long long result = expression_type_neutral_element(m_type);
     for (const ast::Argument& arg : d.get_arguments()) {
         std::pmr::vector<char8_t> arg_text { context.get_transient_memory() };
-        to_plaintext(arg_text, arg.get_content(), context);
+        const auto arg_status = to_plaintext(arg_text, arg.get_content(), context);
+        if (arg_status != Content_Status::ok) {
+            return arg_status;
+        }
         const auto arg_string = as_u8string_view(arg_text);
 
         const std::optional x = from_chars<long long>(arg_string);
@@ -50,9 +54,10 @@ void Expression_Behavior::generate_plaintext(
                 arg_string,
                 u8"\" is not a valid integer.",
             };
-            context.try_error(diagnostic::arithmetic_parse, arg.get_source_span(), message);
-            try_generate_error_plaintext(out, d, context);
-            return;
+            context.try_error(
+                diagnostic::arithmetic_parse, arg.get_source_span(), joined_char_sequence(message)
+            );
+            return try_generate_error(out, d, context);
         }
         if (m_type == Expression_Type::divide && *x == 0) {
             const std::u8string_view message[] {
@@ -60,68 +65,52 @@ void Expression_Behavior::generate_plaintext(
                 arg_string,
                 u8"\" evaluated to zero, and a division by zero would occur.",
             };
-            context.try_error(diagnostic::arithmetic_div_by_zero, arg.get_source_span(), message);
-            try_generate_error_plaintext(out, d, context);
-            return;
+            context.try_error(
+                diagnostic::arithmetic_div_by_zero, arg.get_source_span(),
+                joined_char_sequence(message)
+            );
+            return try_generate_error(out, d, context);
         }
         result = operate(m_type, result, *x);
     }
+
+    try_enter_paragraph(out);
+
     const Characters8 result_chars = to_characters8(result);
-    append(out, result_chars.as_string());
+    out.write(result_chars.as_string(), Output_Language::text);
+    return Content_Status::ok;
 }
 
-void Variable_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    const Argument_Matcher& args,
-    Context& context
-) const
+Content_Status
+Variable_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
+    Argument_Matcher args { parameters, context.get_transient_memory() };
+    args.match(d.get_arguments());
+
     std::pmr::vector<char8_t> data { context.get_transient_memory() };
     if (argument_to_plaintext(data, d, args, var_parameter, context)) {
-        generate_var_plaintext(out, d, as_u8string_view(data), context);
+        return generate_var(out, d, as_u8string_view(data), context);
     }
+    return Content_Status::error;
 }
 
-void Variable_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    const Argument_Matcher& args,
-    Context& context
-) const
-{
-    std::pmr::vector<char8_t> data { context.get_transient_memory() };
-    if (argument_to_plaintext(data, d, args, var_parameter, context)) {
-        generate_var_html(out, d, as_u8string_view(data), context);
-    }
-}
-
-void Get_Variable_Behavior::generate_var_plaintext(
-    std::pmr::vector<char8_t>& out,
+Content_Status Get_Variable_Behavior::generate_var(
+    Content_Policy& out,
     const ast::Directive&,
     std::u8string_view var,
     Context& context
 ) const
 {
+    try_enter_paragraph(out);
+
     const auto it = context.get_variables().find(var);
     if (it != context.get_variables().end()) {
-        out.insert(out.end(), it->second.begin(), it->second.end());
+        out.write(std::u8string_view { it->second }, Output_Language::text);
     }
+    return Content_Status::ok;
 }
 
-void Get_Variable_Behavior::generate_var_html(
-    HTML_Writer& out,
-    const ast::Directive&,
-    std::u8string_view var,
-    Context& context
-) const
-{
-    if (const std::pmr::u8string* const value = context.get_variable(var)) {
-        out.write_inner_html(*value);
-    }
-}
-
-void process(
+Content_Status set_variable_to_op_result(
     Variable_Operation op,
     const ast::Directive& d,
     std::u8string_view var,
@@ -129,7 +118,10 @@ void process(
 )
 {
     std::pmr::vector<char8_t> body_string { context.get_transient_memory() };
-    to_plaintext(body_string, d.get_content(), context);
+    const auto status = to_plaintext(body_string, d.get_content(), context);
+    if (status != Content_Status::ok) {
+        return status;
+    }
 
     const auto it = context.get_variables().find(var);
     if (op == Variable_Operation::set) {
@@ -144,6 +136,7 @@ void process(
             it->second = std::move(value);
         }
     }
+    return Content_Status::ok;
 }
 
 } // namespace cowel

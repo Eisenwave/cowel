@@ -5,6 +5,8 @@
 #include "cowel/builtin_directive_set.hpp"
 #include "cowel/directive_processing.hpp"
 
+using namespace std::string_view_literals;
+
 namespace cowel {
 namespace {
 
@@ -72,14 +74,15 @@ constexpr std::ptrdiff_t mathml_element_index(std::u8string_view name)
 static_assert(mathml_permits_text_bits[mathml_element_index(u8"mi")]);
 static_assert(!mathml_permits_text_bits[mathml_element_index(u8"munderover")]);
 
-void to_math_html(
-    HTML_Writer& out,
+[[nodiscard]]
+Content_Status to_math_html(
+    Content_Policy& out,
     std::span<const ast::Content> contents,
     Context& context,
     bool permit_text = false
 )
 {
-    for (const ast::Content& c : contents) {
+    return process_greedy(contents, [&](const ast::Content& c) -> Content_Status {
         const auto* const d = std::get_if<ast::Directive>(&c);
         if (!d) {
             if (!permit_text) {
@@ -92,47 +95,61 @@ void to_math_html(
                         diagnostic::math::text, ast::get_source_span(c),
                         u8"Text cannot appear in this context. "
                         u8"MathML requires text to be enclosed in <mi>, <mn>, etc., "
-                        u8"which correspond to \\mi, \\mn, and other pseudo-directives."
+                        u8"which correspond to \\mi, \\mn, and other pseudo-directives."sv
                     );
                 }
             }
-            to_html(out, c, context);
-            continue;
+            return out.consume_content(c, context);
         }
         const std::u8string_view name = d->get_name();
         const std::ptrdiff_t index = mathml_element_index(name);
         if (index < 0) {
-            to_html(out, *d, context);
-            continue;
+            return out.consume(*d, context);
         }
-        Attribute_Writer attributes = out.open_tag_with_attributes(name);
-        named_arguments_to_attributes(attributes, *d, context);
-        attributes.end();
         warn_ignored_argument_subset(d->get_arguments(), context, Argument_Subset::positional);
 
+        HTML_Writer writer { out };
+        Attribute_Writer attributes = writer.open_tag_with_attributes(name);
+        const auto attributes_status = named_arguments_to_attributes(attributes, *d, context);
+        attributes.end();
+        if (status_is_break(attributes_status)) {
+            writer.close_tag(name);
+            return attributes_status;
+        }
+
         const bool child_permits_text = mathml_permits_text_bits[std::size_t(index)];
-        to_math_html(out, d->get_content(), context, child_permits_text);
-        out.close_tag(name);
-    }
+        const auto nested_status = to_math_html(out, d->get_content(), context, child_permits_text);
+        writer.close_tag(name);
+        return status_concat(attributes_status, nested_status);
+    });
 }
 
 } // namespace
 
-void Math_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
+Content_Status
+Math_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
     constexpr std::u8string_view tag_name = u8"math";
     const std::u8string_view display_string
-        = display == Directive_Display::block ? u8"block" : u8"inline";
+        = m_display == Directive_Display::in_line ? u8"inline" : u8"block";
 
-    Attribute_Writer attributes = out.open_tag_with_attributes(tag_name);
+    ensure_paragraph_matches_display(out, m_display);
+
+    HTML_Content_Policy policy { out };
+    HTML_Writer writer { policy };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(tag_name);
     attributes.write_attribute(u8"display", display_string);
-    named_arguments_to_attributes(attributes, d, context);
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
     attributes.end();
     warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
+    if (status_is_break(attributes_status)) {
+        writer.close_tag(tag_name);
+        return attributes_status;
+    }
 
-    to_math_html(out, d.get_content(), context);
-
-    out.close_tag(tag_name);
+    const auto nested_status = to_math_html(policy, d.get_content(), context);
+    writer.close_tag(tag_name);
+    return status_concat(attributes_status, nested_status);
 }
 
 } // namespace cowel

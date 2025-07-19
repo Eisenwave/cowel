@@ -78,7 +78,6 @@ include_directories(${INCLUDE_DIRS})
 set(LIBRARY_SOURCES
     src/main/cpp/util/code_point_names.cpp
     src/main/cpp/util/draft_uris.cpp
-    src/main/cpp/util/html_writer.cpp
     src/main/cpp/util/html_entities.cpp
     src/main/cpp/util/io.cpp
     src/main/cpp/util/tty.cpp
@@ -100,6 +99,7 @@ set(LIBRARY_SOURCES
 
     src/main/cpp/argument_matching.cpp
     src/main/cpp/build_ast.cpp
+    src/main/cpp/content_policies.cpp
     src/main/cpp/cowel_lib.cpp
     src/main/cpp/directive_processing.cpp
     src/main/cpp/builtin_directive_set.cpp
@@ -169,6 +169,7 @@ else()
         add_executable(cowel-test ${HEADERS}
             src/test/cpp/document_file_testing.cpp
             src/test/cpp/main.cpp
+            src/test/cpp/test_char_sequence.cpp
             src/test/cpp/test_chars_strings.cpp
             src/test/cpp/test_document_generation.cpp
             src/test/cpp/test_draft_uris.cpp

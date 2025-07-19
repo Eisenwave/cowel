@@ -257,7 +257,7 @@ public:
         return m_logger.can_log(severity);
     }
 
-    void emit(const Diagnostic& diagnostic)
+    void emit(Diagnostic diagnostic)
     {
         COWEL_ASSERT(emits(diagnostic.severity));
         m_logger(diagnostic);
@@ -267,74 +267,34 @@ public:
         Severity severity,
         string_view_type id,
         const File_Source_Span& location,
-        std::span<const string_view_type> message
+        Char_Sequence8 message
     )
     {
         emit({ severity, id, location, message });
     }
 
-    void emit_debug(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void emit_debug(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         emit(Severity::debug, id, location, message);
     }
 
-    void emit_debug(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        emit_debug(id, location, { &message, 1 });
-    }
-
-    void emit_soft_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void
+    emit_soft_warning(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         emit(Severity::soft_warning, id, location, message);
     }
 
-    void emit_soft_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        string_view_type message
-    )
-    {
-        emit_debug(id, location, { &message, 1 });
-    }
-
-    void emit_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void emit_warning(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         emit(Severity::warning, id, location, message);
     }
 
-    void
-    emit_warning(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        emit_debug(id, location, { &message, 1 });
-    }
-
-    void emit_error(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void emit_error(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         emit(Severity::error, id, location, message);
     }
 
-    void emit_error(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        emit_error(id, location, { &message, 1 });
-    }
-
-    void try_emit(const Diagnostic& diagnostic)
+    void try_emit(Diagnostic diagnostic)
     {
         if (emits(diagnostic.severity)) {
             emit(diagnostic);
@@ -345,7 +305,7 @@ public:
         Severity severity,
         string_view_type id,
         const File_Source_Span& location,
-        std::span<const string_view_type> message
+        Char_Sequence8 message
     )
     {
         if (emits(severity)) {
@@ -353,65 +313,25 @@ public:
         }
     }
 
-    void try_debug(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void try_debug(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         try_emit(Severity::debug, id, location, message);
     }
 
-    void try_debug(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        try_debug(id, location, { &message, 1 });
-    }
-
-    void try_soft_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void
+    try_soft_warning(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         try_emit(Severity::soft_warning, id, location, message);
     }
 
-    void try_soft_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        string_view_type message
-    )
-    {
-        try_soft_warning(id, location, { &message, 1 });
-    }
-
-    void try_warning(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void try_warning(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         try_emit(Severity::warning, id, location, message);
     }
 
-    void
-    try_warning(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        try_warning(id, location, { &message, 1 });
-    }
-
-    void try_error(
-        string_view_type id,
-        const File_Source_Span& location,
-        std::span<const string_view_type> message
-    )
+    void try_error(string_view_type id, const File_Source_Span& location, Char_Sequence8 message)
     {
         try_emit(Severity::error, id, location, message);
-    }
-
-    void try_error(string_view_type id, const File_Source_Span& location, string_view_type message)
-    {
-        try_error(id, location, { &message, 1 });
     }
 
     void add_resolver(const Name_Resolver& resolver)

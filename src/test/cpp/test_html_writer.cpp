@@ -3,12 +3,13 @@
 #include <memory_resource>
 #include <span>
 #include <string_view>
-#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "cowel/util/html_entities.hpp"
 #include "cowel/util/html_writer.hpp"
+
+#include "cowel/policy/capture.hpp"
 
 namespace cowel {
 namespace {
@@ -21,14 +22,14 @@ std::u8string_view as_view(std::span<const char8_t> span)
 
 struct HTML_Writer_Test : testing::Test {
     std::pmr::monotonic_buffer_resource memory;
-    std::pmr::vector<char8_t> out { &memory };
+    Vector_Text_Sink out { Output_Language::html, &memory };
     HTML_Writer writer { out };
 };
 
 TEST_F(HTML_Writer_Test, empty)
 {
     constexpr std::u8string_view expected;
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, inner_html)
@@ -37,7 +38,7 @@ TEST_F(HTML_Writer_Test, inner_html)
 
     writer.write_inner_html(u8"<html>Hello, world!</html>");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, inner_text)
@@ -46,7 +47,7 @@ TEST_F(HTML_Writer_Test, inner_text)
 
     writer.write_inner_text(u8"<hello&");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, tag)
@@ -57,7 +58,7 @@ TEST_F(HTML_Writer_Test, tag)
     writer.write_inner_text(u8"Hello, world!");
     writer.close_tag(u8"b");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, empty_tag)
@@ -66,7 +67,7 @@ TEST_F(HTML_Writer_Test, empty_tag)
 
     writer.write_self_closing_tag(u8"br");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, empty_attributes)
@@ -80,7 +81,7 @@ TEST_F(HTML_Writer_Test, empty_attributes)
         .end();
     writer.close_tag(u8"x");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, attributes_with_values_quotes_if_needed)
@@ -94,7 +95,7 @@ TEST_F(HTML_Writer_Test, attributes_with_values_quotes_if_needed)
         .end();
     writer.close_tag(u8"x");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, attributes_with_values_always_quotes)
@@ -108,7 +109,7 @@ TEST_F(HTML_Writer_Test, attributes_with_values_always_quotes)
         .end();
     writer.close_tag(u8"x");
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, attributes_but_empty)
@@ -117,7 +118,7 @@ TEST_F(HTML_Writer_Test, attributes_but_empty)
 
     writer.open_tag_with_attributes(u8"br").end_empty();
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST_F(HTML_Writer_Test, attributes_escape)
@@ -128,7 +129,7 @@ TEST_F(HTML_Writer_Test, attributes_escape)
         .write_attribute(u8"id", u8"'", Attribute_Style::single_if_needed)
         .end_empty();
 
-    EXPECT_EQ(expected, as_view(out));
+    EXPECT_EQ(expected, as_view(*out));
 }
 
 TEST(HTML_Entities, empty)

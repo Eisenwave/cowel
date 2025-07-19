@@ -15,6 +15,7 @@
 #include "cowel/util/source_position.hpp"
 
 #include "cowel/fwd.hpp"
+#include "cowel/output_language.hpp"
 
 namespace cowel::ast {
 namespace detail {
@@ -266,37 +267,23 @@ public:
     }
 };
 
-enum struct Generated_Type : bool { plaintext, html };
-
 struct Generated final {
 private:
     std::pmr::vector<char8_t> m_data;
-    Generated_Type m_type;
-    Directive_Display m_display;
+    Output_Language m_type;
 
 public:
     [[nodiscard]]
-    explicit Generated(
-        std::pmr::vector<char8_t>&& data,
-        Generated_Type type,
-        Directive_Display display
-    )
+    explicit Generated(std::pmr::vector<char8_t>&& data, Output_Language type)
         : m_data { std::move(data) }
         , m_type { type }
-        , m_display { display }
     {
     }
 
     [[nodiscard]]
-    constexpr Generated_Type get_type() const
+    constexpr Output_Language get_type() const
     {
         return m_type;
-    }
-
-    [[nodiscard]]
-    constexpr Directive_Display get_display() const
-    {
-        return m_display;
     }
 
     [[nodiscard]]

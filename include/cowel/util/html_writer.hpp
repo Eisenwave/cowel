@@ -1,6 +1,7 @@
 #ifndef COWEL_HTML_WRITER_HPP
 #define COWEL_HTML_WRITER_HPP
 
+#include <algorithm>
 #include <cstddef>
 #include <span>
 #include <string_view>
@@ -8,24 +9,31 @@
 
 #include "cowel/util/assert.hpp"
 #include "cowel/util/chars.hpp"
+#include "cowel/util/html.hpp"
+#include "cowel/util/strings.hpp"
+#include "cowel/util/url_encode.hpp"
+
+#include "cowel/policy/content_policy.hpp"
 
 #include "cowel/fwd.hpp"
 
 namespace cowel {
 
-/// @brief Appends text to a vector without any processing.
-void append(std::pmr::vector<char8_t>& out, std::u8string_view text);
+enum struct Attribute_Encoding : Default_Underlying {
+    text,
+    url,
+};
 
-/// @brief Appends text to the vector where characters in `charset`
-/// are replaced with their corresponding HTML entities.
-/// For example, if `charset` includes `&`, `&amp;` is appended in its stead.
-///
-/// Currently, `charset` must be a subset of `&`, `<`, `>`, `'`, `"`.
-void append_html_escaped(
-    std::pmr::vector<char8_t>& out,
-    std::u8string_view text,
-    std::u8string_view charset
-);
+enum struct Attribute_Quoting : bool {
+    none,
+    quoted,
+};
+
+/// @brief Appends text to a vector without any processing.
+inline void append(std::pmr::vector<char8_t>& out, std::u8string_view text)
+{
+    out.insert(out.end(), text.data(), text.data() + text.size());
+}
 
 enum struct Attribute_Style : Default_Underlying {
     /// @brief Always use double quotes, like `id="name" class="a b" hidden=""`.
@@ -56,6 +64,9 @@ constexpr char8_t attribute_style_quote_char(Attribute_Style style)
     COWEL_ASSERT_UNREACHABLE(u8"Invalid attribute style.");
 }
 
+template <string_or_char_consumer Out>
+struct Basic_Attribute_Writer;
+
 /// @brief A class which provides member functions for writing HTML content to a stream
 /// correctly.
 /// Both entire HTML documents can be written, as well as HTML snippets.
@@ -68,15 +79,14 @@ constexpr char8_t attribute_style_quote_char(Attribute_Style style)
 /// To correctly use this class, the opening tags must match the closing tags.
 /// I.e. for every `begin_tag(tag, type)` or `begin_tag_with_attributes(tag, type)`,
 /// there must be a matching `end_tag(tag, type)`.
-struct HTML_Writer {
+template <string_or_char_consumer Out>
+struct Basic_HTML_Writer {
 public:
-    friend struct Attribute_Writer;
-    using Self = HTML_Writer;
-    using char_type = char8_t;
-    using string_view_type = std::u8string_view;
+    friend Basic_Attribute_Writer<Out>;
+    using Self = Basic_HTML_Writer;
 
 private:
-    std::pmr::vector<char_type>& m_out;
+    Out m_out;
 
     std::size_t m_depth = 0;
     bool m_in_attributes = false;
@@ -87,20 +97,30 @@ public:
     /// `out.fail()` shall be true.
     /// @param out the output stream
     [[nodiscard]]
-    explicit HTML_Writer(std::pmr::vector<char_type>& out) noexcept
+    explicit Basic_HTML_Writer(const Out& out)
         : m_out { out }
     {
     }
+    [[nodiscard]]
+    explicit Basic_HTML_Writer(Out&& out)
+        : m_out { std::move(out) }
+    {
+    }
 
-    HTML_Writer(const HTML_Writer&) = delete;
-    HTML_Writer& operator=(const HTML_Writer&) = delete;
+    Basic_HTML_Writer(const Basic_HTML_Writer&) = delete;
+    Basic_HTML_Writer& operator=(const Basic_HTML_Writer&) = delete;
 
-    ~HTML_Writer() = default;
+    ~Basic_HTML_Writer() = default;
+
+    Out& get_output()
+    {
+        return m_out;
+    }
 
     /// @brief Returns the output vector that this writers has been constructed with,
     /// and to which all output is written.
     [[nodiscard]]
-    std::pmr::vector<char_type>& get_output() const
+    const Out& get_output() const
     {
         return m_out;
     }
@@ -128,19 +148,63 @@ public:
     /// @brief Writes the `<!DOCTYPE ...` preamble for the HTML file.
     /// For whole documents should be called exactly once, prior to any other `write` functions.
     /// However, it is not required to call this.
-    Self& write_preamble();
+    Self& write_preamble()
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        m_out(u8"<!DOCTYPE html>\n");
+        return *this;
+    }
 
     /// @brief Writes a self-closing tag such as `<br/>` or `<hr/>`.
-    Self& write_self_closing_tag(string_view_type id);
+    Self& write_self_closing_tag(std::u8string_view id)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        COWEL_ASSERT(is_html_tag_name(id));
+
+        m_out(u8'<');
+        m_out(id);
+        m_out(u8"/>");
+
+        return *this;
+    }
 
     /// @brief Writes an HTML comment with the given contents.
-    Self& write_comment(string_view_type comment);
+    Self& write_comment(std::u8string_view comment)
+    {
+        m_out(u8"<!--");
+        append_html_escaped_of(m_out, comment, u8"<>");
+        m_out(u8"-->");
+        return *this;
+    }
 
     /// @brief Writes an opening tag such as `<div>`.
-    Self& open_tag(string_view_type id);
+    Self& open_tag(std::u8string_view id)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        COWEL_ASSERT(is_html_tag_name(id));
+
+        m_out(u8'<');
+        m_out(id);
+        m_out(u8'>');
+        ++m_depth;
+
+        return *this;
+    }
 
     /// @brief Writes an opening tag immediately followed by a closing tag, like `<div></div>`.
-    Self& open_and_close_tag(string_view_type id);
+    Self& open_and_close_tag(std::u8string_view id)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        COWEL_ASSERT(is_html_tag_name(id));
+
+        m_out(u8'<');
+        m_out(id);
+        m_out(u8"></");
+        m_out(id);
+        m_out(u8'>');
+
+        return *this;
+    }
 
     /// @brief Writes an incomplete opening tag such as `<div`.
     /// Returns an `Attribute_Writer` which must be used to write attributes (if any)
@@ -148,77 +212,216 @@ public:
     /// @param properties the tag properties
     /// @return `*this`
     [[nodiscard]]
-    Attribute_Writer open_tag_with_attributes(string_view_type id);
+    Basic_Attribute_Writer<Out> open_tag_with_attributes(std::u8string_view id)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        COWEL_ASSERT(is_html_tag_name(id));
+
+        m_out(u8'<');
+        m_out(id);
+
+        return Basic_Attribute_Writer<Out> { *this };
+    }
 
     /// @brief Writes a closing tag, such as `</div>`.
     /// The most recent call to `open_tag` or `open_tag_with_attributes` shall have been made with
     /// the same arguments.
-    Self& close_tag(string_view_type id);
+    Self& close_tag(std::u8string_view id)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        COWEL_ASSERT(is_html_tag_name(id));
+        COWEL_ASSERT(m_depth != 0);
+
+        --m_depth;
+
+        m_out(u8"</");
+        m_out(id);
+        m_out(u8'>');
+
+        return *this;
+    }
 
     /// @brief Writes text between tags.
     /// Text characters such as `<` or `>` which interfere with HTML are converted to entities.
-    void write_inner_text(string_view_type text);
-    void write_inner_text(std::u32string_view text);
-
+    void write_inner_text(std::u8string_view text)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        append_html_escaped_of(m_out, text, u8"&<>");
+    }
+    void write_inner_text(std::u32string_view text)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        for (const char32_t c : text) {
+            write_inner_text(c);
+        }
+    }
     void write_inner_text(char8_t c)
     {
         COWEL_DEBUG_ASSERT(is_ascii(c));
         write_inner_text({ &c, 1 });
     }
-
-    void write_inner_text(char32_t c);
+    void write_inner_text(char32_t c)
+    {
+        COWEL_DEBUG_ASSERT(!m_in_attributes);
+        COWEL_DEBUG_ASSERT(is_scalar_value(c));
+        m_out(
+            is_html_min_raw_passthrough_character(c) ? utf8::encode8_unchecked(c).as_string()
+                                                     : html_entity_of(c)
+        );
+    }
 
     /// @brief Writes HTML content between tags.
     /// Unlike `write_inner_text`, does not escape any entities.
     ///
     /// WARNING: Improper use of this function can easily result in incorrect HTML output.
-    void write_inner_html(std::u8string_view text);
-    void write_inner_html(std::u32string_view text);
-
+    void write_inner_html(std::u8string_view text)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        m_out(text);
+    }
+    void write_inner_html(std::u32string_view text)
+    {
+        COWEL_ASSERT(!m_in_attributes);
+        for (const char32_t c : text) {
+            write_inner_html(c);
+        }
+    }
     void write_inner_html(char8_t c)
     {
         COWEL_DEBUG_ASSERT(is_ascii(c));
-        do_write(c);
+        m_out(c);
     }
-    void write_inner_html(char32_t c);
+    void write_inner_html(char32_t c)
+    {
+        COWEL_DEBUG_ASSERT(!m_in_attributes);
+        COWEL_DEBUG_ASSERT(is_scalar_value(c));
+        m_out(utf8::encode8_unchecked(c).as_string());
+    }
 
 private:
-    enum struct Attribute_Encoding : Default_Underlying {
-        text,
-        url,
-    };
-
-    Self& write_attribute(
-        string_view_type key,
-        string_view_type value,
+    Attribute_Quoting write_attribute(
+        std::u8string_view key,
+        std::u8string_view value,
         Attribute_Style style,
         Attribute_Encoding encoding
     )
     {
         return write_attribute(key, { &value, 1 }, style, encoding);
     }
-    Self& write_attribute(
-        string_view_type key,
-        std::span<const string_view_type> value_parts,
+    Attribute_Quoting write_attribute(
+        std::u8string_view key,
+        std::span<const std::u8string_view> value_parts,
         Attribute_Style style,
         Attribute_Encoding encoding
-    );
+    )
+    {
+        if (std::ranges::all_of(value_parts, [](std::u8string_view s) { return s.empty(); })) {
+            return write_empty_attribute(key, style);
+        }
 
-    Self& write_empty_attribute(string_view_type key, Attribute_Style style);
-    Self& end_attributes();
-    Self& end_empty_tag_attributes();
+        COWEL_ASSERT(m_in_attributes);
+        COWEL_ASSERT(is_html_attribute_name(key));
 
-    void do_write(char_type);
-    void do_write(string_view_type);
+        m_out(u8' ');
+        m_out(key);
+
+        const char8_t quote_char = attribute_style_quote_char(style);
+        m_out(u8'=');
+
+        const bool omit_quotes = !attribute_style_demands_quotes(style)
+            && std::ranges::all_of(value_parts, [](std::u8string_view s) {
+                   return is_html_unquoted_attribute_value(s);
+               });
+
+        if (omit_quotes) {
+            for (const std::u8string_view part : value_parts) {
+                switch (encoding) {
+                case Attribute_Encoding::text: {
+                    m_out(part);
+                    break;
+                }
+                case Attribute_Encoding::url: {
+                    url_encode_ascii_if(m_out, part, [](char8_t c) {
+                        return is_url_always_encoded(c);
+                    });
+                    break;
+                }
+                }
+            }
+        }
+        else {
+            m_out(quote_char);
+            for (const std::u8string_view part : value_parts) {
+                switch (encoding) {
+                case Attribute_Encoding::text: {
+                    append_html_escaped_of(m_out, part, u8"\"'");
+                    break;
+                }
+                case Attribute_Encoding::url: {
+                    url_encode_ascii_if(m_out, part, [](char8_t c) {
+                        static_assert(is_url_always_encoded(u8'"'));
+                        static_assert(!is_url_always_encoded(u8'\''));
+                        return c == u8'\'' || is_url_always_encoded(c);
+                    });
+                    break;
+                }
+                }
+            }
+            m_out(quote_char);
+        }
+
+        return omit_quotes ? Attribute_Quoting::none : Attribute_Quoting::quoted;
+    }
+
+    Attribute_Quoting write_empty_attribute(std::u8string_view key, Attribute_Style style)
+    {
+        COWEL_ASSERT(m_in_attributes);
+        COWEL_ASSERT(is_html_attribute_name(key));
+
+        m_out(u8' ');
+        m_out(key);
+
+        switch (style) {
+        case Attribute_Style::always_double: {
+            m_out(u8"=\"\"");
+            return Attribute_Quoting::quoted;
+        }
+        case Attribute_Style::always_single: {
+            m_out(u8"=''");
+            return Attribute_Quoting::quoted;
+        }
+        default: {
+            return Attribute_Quoting::none;
+        }
+        }
+    }
+    Self& end_attributes()
+    {
+        COWEL_ASSERT(m_in_attributes);
+
+        m_out(u8'>');
+        m_in_attributes = false;
+        ++m_depth;
+
+        return *this;
+    }
+    Self& end_empty_tag_attributes()
+    {
+        COWEL_ASSERT(m_in_attributes);
+
+        m_out(u8"/>");
+        m_in_attributes = false;
+
+        return *this;
+    }
 };
 
 /// @brief RAII helper class which lets us write attributes more conveniently.
 /// This class is not intended to be used directly, but with the help of `HTML_Writer`.
-struct Attribute_Writer {
+template <string_or_char_consumer Out>
+struct Basic_Attribute_Writer {
 private:
-    using string_view_type = HTML_Writer::string_view_type;
-
-    HTML_Writer& m_writer;
+    Basic_HTML_Writer<Out>& m_writer;
     /// @brief If this is `true`,
     /// it would not be safe to append a `/` character to the written data because it may be
     /// included in the value of an attribute.
@@ -227,14 +430,14 @@ private:
     bool m_unsafe_slash = false;
 
 public:
-    explicit Attribute_Writer(HTML_Writer& writer)
+    explicit Basic_Attribute_Writer(Basic_HTML_Writer<Out>& writer)
         : m_writer(writer)
     {
         m_writer.m_in_attributes = true;
     }
 
-    Attribute_Writer(const Attribute_Writer&) = delete;
-    Attribute_Writer& operator=(const Attribute_Writer&) = delete;
+    Basic_Attribute_Writer(const Basic_Attribute_Writer&) = delete;
+    Basic_Attribute_Writer& operator=(const Basic_Attribute_Writer&) = delete;
 
     /// @brief Writes an attribute to the stream, such as `class=centered`.
     /// If `value` is empty, writes `key` on its own.
@@ -243,49 +446,49 @@ public:
     /// @param key the attribute key; `is_identifier(key)` shall be `true`.
     /// @param value the attribute value, or an empty string
     /// @return `*this`
-    Attribute_Writer& write_attribute(
-        string_view_type key,
-        string_view_type value,
+    Basic_Attribute_Writer& write_attribute(
+        std::u8string_view key,
+        std::u8string_view value,
         Attribute_Style style = Attribute_Style::double_if_needed
     )
     {
-        m_writer.write_attribute(key, value, style, HTML_Writer::Attribute_Encoding::text);
-        const char8_t back = m_writer.m_out.back();
-        m_unsafe_slash = back != u8'\'' && back != u8'"';
+        const Attribute_Quoting quoting
+            = m_writer.write_attribute(key, value, style, Attribute_Encoding::text);
+        m_unsafe_slash = quoting == Attribute_Quoting::none;
         return *this;
     }
 
     /// @brief Like the overload taking a single `string_view` as a value,
     /// but allows for the attribute to consist of multiple parts,
     /// which are joined together.
-    Attribute_Writer& write_attribute(
-        string_view_type key,
-        std::span<const string_view_type> value_parts,
+    Basic_Attribute_Writer& write_attribute(
+        std::u8string_view key,
+        std::span<const std::u8string_view> value_parts,
         Attribute_Style style = Attribute_Style::double_if_needed
     )
     {
-        m_writer.write_attribute(key, value_parts, style, HTML_Writer::Attribute_Encoding::text);
-        const char8_t back = m_writer.m_out.back();
-        m_unsafe_slash = back != u8'\'' && back != u8'"';
+        const Attribute_Quoting quoting
+            = m_writer.write_attribute(key, value_parts, style, Attribute_Encoding::text);
+        m_unsafe_slash = quoting == Attribute_Quoting::none;
         return *this;
     }
 
     /// @brief Like `write_attribute`,
     /// but applies minimal URL encoding to the value.
-    Attribute_Writer& write_url_attribute(
-        string_view_type key,
-        string_view_type value,
+    Basic_Attribute_Writer& write_url_attribute(
+        std::u8string_view key,
+        std::u8string_view value,
         Attribute_Style style = Attribute_Style::double_if_needed
     )
     {
-        m_writer.write_attribute(key, value, style, HTML_Writer::Attribute_Encoding::url);
-        const char8_t back = m_writer.m_out.back();
-        m_unsafe_slash = back != u8'\'' && back != u8'"';
+        const Attribute_Quoting quoting
+            = m_writer.write_attribute(key, value, style, Attribute_Encoding::url);
+        m_unsafe_slash = quoting == Attribute_Quoting::none;
         return *this;
     }
 
-    Attribute_Writer& write_empty_attribute(
-        string_view_type key,
+    Basic_Attribute_Writer& write_empty_attribute(
+        std::u8string_view key,
         Attribute_Style style = Attribute_Style::double_if_needed
     )
     {
@@ -294,61 +497,65 @@ public:
         return *this;
     }
 
-    Attribute_Writer&
-    write_charset(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer& write_charset(
+        std::u8string_view value,
+        Attribute_Style style = Attribute_Style::double_if_needed
+    )
     {
         return write_attribute(u8"charset", value, style);
     }
 
-    Attribute_Writer&
-    write_class(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_class(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_attribute(u8"class", value, style);
     }
 
-    Attribute_Writer&
-    write_content(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer& write_content(
+        std::u8string_view value,
+        Attribute_Style style = Attribute_Style::double_if_needed
+    )
     {
         return write_attribute(u8"content", value, style);
     }
 
-    Attribute_Writer& write_crossorigin()
+    Basic_Attribute_Writer& write_crossorigin()
     {
         return write_empty_attribute(u8"crossorigin");
     }
 
-    Attribute_Writer&
-    write_href(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_href(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_url_attribute(u8"href", value, style);
     }
 
-    Attribute_Writer&
-    write_id(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_id(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_attribute(u8"id", value, style);
     }
 
-    Attribute_Writer&
-    write_name(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_name(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_attribute(u8"name", value, style);
     }
 
-    Attribute_Writer&
-    write_rel(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_rel(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_attribute(u8"rel", value, style);
     }
 
-    Attribute_Writer&
-    write_src(string_view_type value, Attribute_Style style = Attribute_Style::double_if_needed)
+    Basic_Attribute_Writer&
+    write_src(std::u8string_view value, Attribute_Style style = Attribute_Style::double_if_needed)
     {
         return write_attribute(u8"src", value, style);
     }
 
-    Attribute_Writer& write_tabindex(
-        string_view_type value,
+    Basic_Attribute_Writer& write_tabindex(
+        std::u8string_view value,
         Attribute_Style style = Attribute_Style::double_if_needed
     )
     {
@@ -358,7 +565,7 @@ public:
     /// @brief Writes `>` and finishes writing attributes.
     /// This function or `end_empty()` shall be called exactly once prior to destruction of this
     /// writer.
-    Attribute_Writer& end()
+    Basic_Attribute_Writer& end()
     {
         m_writer.end_attributes();
         return *this;
@@ -367,10 +574,10 @@ public:
     /// @brief Writes `/>` and finishes writing attributes.
     /// This function or `end()` shall be called exactly once prior to destruction of this
     /// writer.
-    Attribute_Writer& end_empty()
+    Basic_Attribute_Writer& end_empty()
     {
         if (m_unsafe_slash) {
-            m_writer.do_write(u8' ');
+            m_writer.m_out(u8' ');
         }
         m_writer.end_empty_tag_attributes();
         return *this;
@@ -378,12 +585,34 @@ public:
 
     /// @brief Destructor.
     /// A call to `end()` or `end_empty()` shall have been made prior to destruction.
-    ~Attribute_Writer() noexcept(false)
+    ~Basic_Attribute_Writer() noexcept(false)
     {
         // This indicates that end() or end_empty() weren't called.
         COWEL_ASSERT(!m_writer.m_in_attributes);
     }
 };
+
+struct To_Text_Sink_Consumer {
+    Text_Sink& out;
+
+    [[nodiscard]]
+    To_Text_Sink_Consumer(Text_Sink& out)
+        : out { out }
+    {
+    }
+
+    void operator()(std::u8string_view str) const
+    {
+        out.write(str, Output_Language::html);
+    }
+    void operator()(char8_t c) const
+    {
+        out.write(c, Output_Language::html);
+    }
+};
+
+using HTML_Writer = Basic_HTML_Writer<To_Text_Sink_Consumer>;
+using Attribute_Writer = Basic_Attribute_Writer<To_Text_Sink_Consumer>;
 
 } // namespace cowel
 

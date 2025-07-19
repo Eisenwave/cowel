@@ -2,33 +2,38 @@
 #include <string_view>
 #include <vector>
 
-#include "cowel/diagnostic.hpp"
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/function_ref.hpp"
 #include "cowel/util/strings.hpp"
+#include "cowel/util/to_chars.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
+#include "cowel/diagnostic.hpp"
 #include "cowel/directive_arguments.hpp"
 #include "cowel/directive_processing.hpp"
 #include "cowel/document_sections.hpp"
-#include "cowel/util/to_chars.hpp"
+
+using namespace std::string_view_literals;
 
 namespace cowel {
 namespace {
 
-bool synthesize_id(
+[[nodiscard]]
+Content_Status synthesize_id(
     std::pmr::vector<char8_t>& out,
     std::span<const ast::Content> content,
     Context& context
 )
 {
     // TODO: diagnostic on bad status
-    const To_Plaintext_Status status
-        = to_plaintext(out, content, context, To_Plaintext_Mode::no_side_effects);
-    if (status == To_Plaintext_Status::error) {
-        return false;
+    // TODO: disallow side effects, or maybe use content policies to pull out just the text?
+    const auto status = to_plaintext(out, content, context);
+    if (status != Content_Status::ok) {
+        return status;
     }
     sanitize_html_id(out);
-    return true;
+    return Content_Status::ok;
 }
 
 // TODO: this should be done via variables and the context or something
@@ -39,8 +44,8 @@ constexpr int max_listing_level = 6;
 
 } // namespace
 
-void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context)
-    const
+Content_Status
+Heading_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
     static constexpr std::u8string_view parameters[] { u8"id", u8"listed", u8"show-number" };
 
@@ -53,12 +58,27 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
 
     // Determine whether the heading should be listed in the table of contents.
     const bool listed_by_default = m_level >= min_listing_level && m_level <= max_listing_level;
-    const bool is_listed = get_yes_no_argument(
+    const Greedy_Result<bool> is_listed_result = get_yes_no_argument(
         u8"listed", diagnostic::h::listed_invalid, d, args, context, listed_by_default
     );
-    const bool is_number_shown = get_yes_no_argument(
+    if (status_is_break(is_listed_result.status())) {
+        return is_listed_result.status();
+    }
+
+    const Greedy_Result<bool> is_number_shown_result = get_yes_no_argument(
         u8"show-number", diagnostic::h::show_number_invalid, d, args, context, listed_by_default
     );
+    if (status_is_break(is_number_shown_result.status())) {
+        return is_number_shown_result.status();
+    }
+    Content_Status current_status
+        = status_concat(is_listed_result.status(), is_number_shown_result.status());
+
+    // TODO: now that we use Greedy_Result, we should be able to get rid of these
+    //       extra variables, but it's not worth the trouble right now ...
+    const bool is_listed = is_listed_result ? *is_listed_result : listed_by_default;
+    const bool is_number_shown
+        = is_number_shown_result ? *is_number_shown_result : listed_by_default;
 
     if (is_listed) {
         // Update heading numbers.
@@ -68,34 +88,53 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
     }
 
     std::pmr::vector<char8_t> id_data { context.get_transient_memory() };
-    bool has_id = false;
-
-    // 1. Obtain or synthesize the id.
-    Attribute_Writer attributes = out.open_tag_with_attributes(tag_name);
-    if (const int id_index = args.get_argument_index(u8"id"); id_index < 0) {
-        if (synthesize_id(id_data, d.get_content(), context) && !id_data.empty()) {
-            attributes.write_id(as_u8string_view(id_data));
-            has_id = true;
+    const auto id_status = [&] -> Content_Status {
+        const int id_index = args.get_argument_index(u8"id");
+        if (id_index < 0) {
+            return synthesize_id(id_data, d.get_content(), context);
         }
-    }
-    else {
         const ast::Argument& id_arg = d.get_arguments()[std::size_t(id_index)];
-        const To_Plaintext_Status status = to_plaintext(id_data, id_arg.get_content(), context);
-        if (status != To_Plaintext_Status::error) {
-            attributes.write_id(as_u8string_view(id_data));
-            has_id = !id_data.empty();
-        }
+        return to_plaintext(id_data, id_arg.get_content(), context);
+    }();
+    current_status = status_concat(current_status, id_status);
+    if (status_is_break(id_status)) {
+        return current_status;
     }
-    named_arguments_to_attributes(attributes, d, args, context, Argument_Subset::unmatched_named);
+    const bool has_id = id_status == Content_Status::ok && !id_data.empty();
+
     warn_ignored_argument_subset(
         d.get_arguments(), args, context, Argument_Subset::unmatched_positional
     );
+
+    // 0. Ensure that headings are not in paragraphs.
+    try_leave_paragraph(out);
+
+    // 1. Obtain or synthesize the id.
+    HTML_Writer writer { out };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(tag_name);
+    if (has_id) {
+        attributes.write_id(as_u8string_view(id_data));
+    }
+    const auto attributes_status = named_arguments_to_attributes(
+        attributes, d, args, context, Argument_Subset::unmatched_named
+    );
     attributes.end();
+    current_status = status_concat(current_status, attributes_status);
+    if (status_is_break(attributes_status)) {
+        writer.close_tag(tag_name);
+        return current_status;
+    }
 
     // 2. Generate user content in the heading.
     std::pmr::vector<char8_t> heading_html { context.get_transient_memory() };
-    HTML_Writer heading_html_writer { heading_html };
-    to_html(heading_html_writer, d.get_content(), context);
+    Capturing_Ref_Text_Sink heading_sink { heading_html, Output_Language::html };
+    HTML_Content_Policy html_policy { heading_sink };
+    const auto heading_status = consume_all(html_policy, d.get_content(), context);
+    current_status = status_concat(current_status, heading_status);
+    if (status_is_break(heading_status)) {
+        writer.close_tag(tag_name);
+        return current_status;
+    }
     const auto heading_html_string = as_u8string_view(heading_html);
 
     // 3. Check for id duplication.
@@ -113,18 +152,21 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
             id_string_view,
             u8"\". Heading will be generated, but references may be broken.",
         };
-        context.try_warning(diagnostic::duplicate_id, d.get_source_span(), message);
+        context.try_warning(
+            diagnostic::duplicate_id, d.get_source_span(), joined_char_sequence(message)
+        );
         return false;
     }();
 
     // 4. Surround user content with paragraph/anchor link.
     if (has_valid_id) {
         id_data.insert(id_data.begin(), u8'#');
-        out.open_tag_with_attributes(u8"a") //
+        writer
+            .open_tag_with_attributes(u8"a") //
             .write_class(u8"para")
             .write_href(as_u8string_view(id_data))
             .end();
-        out.close_tag(u8"a");
+        writer.close_tag(u8"a");
     }
     const auto write_numbers = [&](HTML_Writer& to) {
         for (int i = min_listing_level; i <= m_level; ++i) {
@@ -136,11 +178,11 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
         }
     };
     if (is_listed && is_number_shown) {
-        write_numbers(out);
-        out.write_inner_html(u8". ");
+        write_numbers(writer);
+        writer.write_inner_html(u8". ");
     }
-    out.write_inner_html(heading_html_string);
-    out.close_tag(tag_name);
+    writer.write_inner_html(heading_html_string);
+    writer.close_tag(tag_name);
 
     // 6. Also write an ID preview in case the heading is referenced via \ref[#id]
 
@@ -153,7 +195,7 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
         section_name += as_u8string_view(id_data).substr(1);
 
         const auto scope = sections.go_to_scoped(section_name);
-        HTML_Writer id_preview_out = sections.current_html();
+        HTML_Writer id_preview_out { sections.current_policy() };
         id_preview_out.write_inner_html(u8"§");
         if (is_listed && is_number_shown) {
             write_numbers(id_preview_out);
@@ -169,7 +211,7 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
     if (is_listed) {
         Document_Sections& sections = context.get_sections();
         const auto scope = sections.go_to_scoped(section_name::table_of_contents);
-        HTML_Writer toc_writer = sections.current_html();
+        HTML_Writer toc_writer { sections.current_policy() };
 
         toc_writer
             .open_tag_with_attributes(u8"div") //
@@ -196,15 +238,18 @@ void Heading_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, 
         }
         toc_writer.write_inner_html(u8'\n'); // non-functional, purely for prettier HTML output
     }
+
+    return current_status;
 }
 
 namespace {
 
-void generate_sectioned(
+[[nodiscard]]
+Content_Status with_section_name(
     const ast::Directive& d,
     Context& context,
     std::u8string_view no_section_diagnostic,
-    Function_Ref<void(std::u8string_view section)> action
+    Function_Ref<Content_Status(std::u8string_view section)> action
 )
 {
     static constexpr std::u8string_view parameters[] { u8"section" };
@@ -213,51 +258,71 @@ void generate_sectioned(
 
     const int arg_index = args.get_argument_index(u8"section");
     if (arg_index < 0) {
-        context.try_error(no_section_diagnostic, d.get_source_span(), u8"No section was provided.");
-        return;
+        context.try_error(
+            no_section_diagnostic, d.get_source_span(), u8"No section was provided."sv
+        );
+        return Content_Status::error;
     }
 
     std::pmr::vector<char8_t> name_data { context.get_transient_memory() };
     const ast::Argument& arg = d.get_arguments()[std::size_t(arg_index)];
-    to_plaintext(name_data, arg.get_content(), context);
-    const auto section_string = as_u8string_view(name_data);
-    if (section_string.empty()) {
-        context.try_error(no_section_diagnostic, d.get_source_span(), u8"No section was provided.");
-        return;
+    const auto name_status = to_plaintext(name_data, arg.get_content(), context);
+    if (name_status != Content_Status::ok) {
+        return name_status;
     }
 
-    action(section_string);
+    const auto section_string = as_u8string_view(name_data);
+    if (section_string.empty()) {
+        context.try_error(
+            no_section_diagnostic, d.get_source_span(), u8"No section was provided."sv
+        );
+        return Content_Status::error;
+    }
+
+    return action(section_string);
 }
 
 } // namespace
 
-void There_Behavior::evaluate(const ast::Directive& d, Context& context) const
+Content_Status
+There_Behavior::operator()(Content_Policy&, const ast::Directive& d, Context& context) const
 {
-    generate_sectioned(d, context, diagnostic::there::no_section, [&](std::u8string_view section) {
+    auto action = [&](std::u8string_view section) {
         const auto scope = context.get_sections().go_to_scoped(section);
-        HTML_Writer there_writer = context.get_sections().current_html();
-        to_html(there_writer, d.get_content(), context);
-    });
+        return consume_all(context.get_sections().current_policy(), d.get_content(), context);
+    };
+    return with_section_name(d, context, diagnostic::there::no_section, action);
 }
 
-void Here_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
+Content_Status
+Here_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
-    generate_sectioned(d, context, diagnostic::there::no_section, [&](std::u8string_view section) {
+    ensure_paragraph_matches_display(out, m_display);
+
+    auto action = [&](std::u8string_view section) {
         reference_section(out, section);
-    });
+        return Content_Status::ok;
+    };
+    return with_section_name(d, context, diagnostic::there::no_section, action);
 }
 
-void Make_Section_Behavior::generate_html(HTML_Writer& out, const ast::Directive&, Context& context)
+Content_Status
+Make_Section_Behavior::operator()(Content_Policy& out, const ast::Directive&, Context& context)
     const
 {
+    ensure_paragraph_matches_display(out, m_display);
+
     context.get_sections().make(m_section_name);
 
     // TODO: warn about ignored arguments and block
-    out.open_tag_with_attributes(u8"div") //
+    HTML_Writer writer { out };
+    writer
+        .open_tag_with_attributes(u8"div") //
         .write_class(m_class_name)
         .end();
     reference_section(out, m_section_name);
-    out.close_tag(u8"div");
+    writer.close_tag(u8"div");
+    return Content_Status::ok;
 }
 
 } // namespace cowel

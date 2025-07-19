@@ -4,6 +4,9 @@
 #include <array>
 #include <string_view>
 
+#include "cowel/util/assert.hpp"
+#include "cowel/util/chars.hpp"
+
 namespace cowel {
 
 /// @brief A lexicographically ordered array of HTML character names such as `u8"amp"`.
@@ -26,6 +29,26 @@ std::array<char32_t, 2> code_points_by_character_reference_name(std::u8string_vi
 /// and an empty string otherwise.
 [[nodiscard]]
 std::u32string_view string_by_character_reference_name(std::u8string_view name) noexcept;
+
+[[nodiscard]]
+inline std::u8string_view html_entity_of(char8_t c)
+{
+    switch (c) {
+    case u8'&': return u8"&amp;";
+    case u8'<': return u8"&lt;";
+    case u8'>': return u8"&gt;";
+    case u8'\'': return u8"&apos;";
+    case u8'"': return u8"&quot;";
+    default: COWEL_ASSERT_UNREACHABLE(u8"We only support a handful of characters.");
+    }
+}
+
+[[nodiscard]]
+inline std::u8string_view html_entity_of(char32_t c)
+{
+    COWEL_DEBUG_ASSERT(is_ascii(c));
+    return html_entity_of(char8_t(c));
+}
 
 } // namespace cowel
 

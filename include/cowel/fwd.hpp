@@ -1,8 +1,6 @@
 #ifndef COWEL_CONFIG_HPP
 #define COWEL_CONFIG_HPP
 
-#include <cstddef>
-
 #ifndef NDEBUG // debug builds
 #define COWEL_DEBUG 1
 #define COWEL_IF_DEBUG(...) __VA_ARGS__
@@ -46,13 +44,10 @@ struct AST_Formatting_Options;
 struct AST_Instruction;
 enum struct AST_Instruction_Type : Default_Underlying;
 enum struct Attribute_Style : Default_Underlying;
-struct Attribute_Writer;
 struct Author_Info;
 struct Builtin_Directive_Set;
 template <typename, typename>
 struct Basic_Annotated_String;
-template <typename Char, std::size_t>
-struct Basic_Characters;
 template <typename File>
 struct Basic_File_Source_Position;
 template <typename File>
@@ -66,21 +61,17 @@ struct Basic_Transparent_String_View_Hash;
 template <typename>
 struct Basic_Transparent_String_View_Less;
 enum struct Diagnostic_Highlight : Default_Underlying;
-struct Content_Behavior;
+struct Content_Policy;
 struct Context;
 struct Diagnostic;
 struct Bibliography;
 struct Document_Info;
 struct Document_Sections;
 struct Directive_Behavior;
-struct Directive_Content_Behavior;
-enum struct Directive_Category : Default_Underlying;
-enum struct Directive_Display : Default_Underlying;
 struct Error_Tag;
 using File_Id = int;
 struct Generation_Options;
 enum struct HLJS_Scope : Default_Underlying;
-struct HTML_Writer;
 struct Ignorant_Logger;
 enum struct IO_Error_Code : Default_Underlying;
 struct Logger;
@@ -108,7 +99,6 @@ struct Content;
 struct Directive;
 struct Escaped;
 struct Generated;
-enum struct Generated_Type : bool;
 struct Text;
 
 } // namespace ast
@@ -117,11 +107,6 @@ template <typename T>
 using Annotated_String = Basic_Annotated_String<char, T>;
 template <typename T>
 using Annotated_String8 = Basic_Annotated_String<char8_t, T>;
-
-template <std::size_t capacity>
-using Characters = Basic_Characters<char, capacity>;
-template <std::size_t capacity>
-using Characters8 = Basic_Characters<char8_t, capacity>;
 
 using Diagnostic_String = Annotated_String8<Diagnostic_Highlight>;
 

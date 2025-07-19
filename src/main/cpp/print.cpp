@@ -111,7 +111,7 @@ void do_print_affected_line(
     const auto line_chars = to_characters<char8_t>(line + 1);
     constexpr std::size_t pad_max = 6;
     const std::size_t pad_length
-        = pad_max - std::min(line_chars.length, std::size_t { pad_max - 1 });
+        = pad_max - std::min(line_chars.length(), std::size_t { pad_max - 1 });
     out.append(pad_length, u8' ');
     out.append_integer(line + 1, Diagnostic_Highlight::line_number);
     out.append(u8' ');
@@ -120,7 +120,7 @@ void do_print_affected_line(
     out.append(cited_code, Diagnostic_Highlight::code_citation);
     out.append(u8'\n');
 
-    const std::size_t align_length = std::max(pad_max, line_chars.length + 1);
+    const std::size_t align_length = std::max(pad_max, line_chars.length() + 1);
     out.append(align_length, u8' ');
     out.append(u8' ');
     out.append(u8'|', Diagnostic_Highlight::punctuation);
@@ -489,6 +489,17 @@ void print_code_string_stderr(const Diagnostic_String& string)
 {
     print_code_string(std::cerr, string, is_stderr_tty);
 }
+
+void flush_stdout()
+{
+    std::cout.flush();
+}
+
+void flush_stderr()
+{
+    std::cerr.flush();
+}
+
 #endif
 
 } // namespace cowel

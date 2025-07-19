@@ -2,29 +2,44 @@
 #include <string_view>
 #include <vector>
 
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/html_writer.hpp"
 #include "cowel/util/strings.hpp"
 #include "cowel/util/url_encode.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
+#include "cowel/directive_arguments.hpp"
 #include "cowel/directive_processing.hpp"
 #include "cowel/services.hpp"
 
-namespace cowel {
+using namespace std::string_view_literals;
 
+namespace cowel {
 namespace {
+
+template <typename Predicate>
+void url_encode_to_writer(
+    HTML_Writer& out,
+    std::u8string_view url,
+    Context& context,
+    Predicate pred
+)
+{
+    std::pmr::vector<char8_t> buffer { context.get_transient_memory() };
+    url_encode_ascii_if(std::back_inserter(buffer), url, pred);
+    out.write_inner_html(as_u8string_view(buffer));
+}
 
 constexpr std::u8string_view bib_item_id_prefix = u8"bib-item-";
 
 constexpr auto is_url_always_encoded_lambda = [](char8_t c) { return is_url_always_encoded(c); };
 
-void write_bibliography_entry(HTML_Writer& out, const Document_Info& info)
+void write_bibliography_entry(HTML_Writer& out, const Document_Info& info, Context& context)
 {
     const auto open_link_tag = [&](std::u8string_view url, bool link_class = false) {
         out.write_inner_html(u8"<a href=\"");
-        url_encode_ascii_if(
-            std::back_inserter(out.get_output()), url, is_url_always_encoded_lambda
-        );
+        url_encode_to_writer(out, url, context, is_url_always_encoded_lambda);
         out.write_inner_html(u8'"');
         if (link_class) {
             out.write_inner_html(u8" class=bib-link");
@@ -98,7 +113,9 @@ void write_bibliography_entry(HTML_Writer& out, const Document_Info& info)
 
 } // namespace
 
-void Bibliography_Add_Behavior::evaluate(const ast::Directive& d, Context& context) const
+Content_Status
+Bibliography_Add_Behavior::operator()(Content_Policy&, const ast::Directive& d, Context& context)
+    const
 {
     static constexpr struct Entry {
         std::u8string_view parameter;
@@ -131,9 +148,9 @@ void Bibliography_Add_Behavior::evaluate(const ast::Directive& d, Context& conte
     if (args.get_argument_index(u8"id") < 0) {
         context.try_error(
             diagnostic::bib::id_missing, d.get_source_span(),
-            u8"An id argument is required to add a bibliography entry."
+            u8"An id argument is required to add a bibliography entry."sv
         );
-        return;
+        return Content_Status::error;
     }
 
     // The following process of converting directive arguments
@@ -153,15 +170,18 @@ void Bibliography_Add_Behavior::evaluate(const ast::Directive& d, Context& conte
         }
         const ast::Argument& arg = d.get_arguments()[std::size_t(index)];
         const std::size_t initial_size = result.text.size();
-        to_plaintext(result.text, arg.get_content(), context);
+        const auto status = to_plaintext(result.text, arg.get_content(), context);
+        if (status != Content_Status::ok) {
+            return status;
+        }
         COWEL_ASSERT(result.text.size() >= initial_size);
 
         if (entry.parameter == u8"id" && result.text.size() == initial_size) {
             context.try_error(
                 diagnostic::bib::id_empty, d.get_source_span(),
-                u8"An id argument for a bibliography entry cannot be empty."
+                u8"An id argument for a bibliography entry cannot be empty."sv
             );
-            return;
+            return Content_Status::error;
         }
 
         string_lengths.push_back(result.text.size() - initial_size);
@@ -182,8 +202,10 @@ void Bibliography_Add_Behavior::evaluate(const ast::Directive& d, Context& conte
             result.info.id,
             u8"\" already exists.",
         };
-        context.try_error(diagnostic::bib::duplicate, d.get_source_span(), message);
-        return;
+        context.try_error(
+            diagnostic::bib::duplicate, d.get_source_span(), joined_char_sequence(message)
+        );
+        return Content_Status::error;
     }
 
     // To facilitate later referencing,
@@ -195,39 +217,41 @@ void Bibliography_Add_Behavior::evaluate(const ast::Directive& d, Context& conte
         std::pmr::u8string section_name { u8"std.bib.", context.get_transient_memory() };
         section_name += result.info.id;
         const auto scope = context.get_sections().go_to_scoped(section_name);
-        HTML_Writer section_out = context.get_sections().current_html();
+        Content_Policy& section_out = context.get_sections().current_policy();
+        HTML_Writer section_writer { section_out };
 
         if (!result.info.link.empty()) {
             // If the document info has a link,
             // then we want references to bibliography entries (e.g. "[N5008]")
             // to use that link.
-            section_out.write_inner_html(u8"<a href=\"");
-            url_encode_ascii_if(
-                std::back_inserter(section_out.get_output()), result.info.link,
-                is_url_always_encoded_lambda
+            section_writer.write_inner_html(u8"<a href=\"");
+            url_encode_to_writer(
+                section_writer, result.info.link, context, is_url_always_encoded_lambda
             );
-            section_out.write_inner_html(u8"\">");
+            section_writer.write_inner_html(u8"\">");
         }
         else {
             // Otherwise, the reference should redirect down
             // to the respective entry within the bibliography.
             // In any case, it's important to guarantee that an <a> element will be emitted.
             const std::u8string_view id_parts[] { u8"#", bib_item_id_prefix, result.info.id };
-            section_out
+            section_writer
                 .open_tag_with_attributes(u8"a") //
                 .write_attribute(u8"id", id_parts)
                 .end();
-            section_out.set_depth(0);
+            section_writer.set_depth(0);
         }
+        return Content_Status::ok;
     }
 
     {
         const auto scope = context.get_sections().go_to_scoped(section_name::bibliography);
-        HTML_Writer bib_writer = context.get_sections().current_html();
-        write_bibliography_entry(bib_writer, result.info);
+        HTML_Writer bib_writer { context.get_sections().current_policy() };
+        write_bibliography_entry(bib_writer, result.info, context);
     }
 
     context.get_bibliography().insert(std::move(result));
+    return Content_Status::ok;
 }
 
 } // namespace cowel

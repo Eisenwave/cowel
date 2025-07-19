@@ -178,10 +178,7 @@ struct Stderr_Logger {
             print_file_position(out, file_entry.name, location);
         }
         out.append(u8' ');
-        for (std::size_t i = 0; i < diagnostic.message_parts_size; ++i) {
-            const auto part = as_u8string_view(diagnostic.message_parts[i]);
-            out.append(part);
-        }
+        out.append(as_u8string_view(diagnostic.message));
         out.append(ansi::h_black);
         out.append(u8" [");
         out.append(as_u8string_view(diagnostic.id));

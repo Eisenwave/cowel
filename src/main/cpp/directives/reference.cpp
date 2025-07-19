@@ -1,11 +1,16 @@
 #include <string_view>
 #include <vector>
 
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/draft_uris.hpp"
 #include "cowel/util/strings.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
+#include "cowel/directive_arguments.hpp"
 #include "cowel/directive_processing.hpp"
+
+using namespace std::string_view_literals;
 
 namespace cowel {
 namespace {
@@ -98,7 +103,8 @@ Reference_Classification classify_reference(std::u8string_view ref)
 
 } // namespace
 
-void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
+Content_Status
+Ref_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
     static const std::u8string_view parameters[] { u8"to" };
     Argument_Matcher args { parameters, context.get_transient_memory() };
@@ -108,7 +114,7 @@ void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Cont
         if (args.argument_statuses()[i] == Argument_Status::unmatched) {
             context.try_warning(
                 diagnostic::ignored_args, d.get_arguments()[i].get_source_span(),
-                u8"This argument was ignored."
+                u8"This argument was ignored."sv
             );
         }
     }
@@ -117,70 +123,81 @@ void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Cont
     if (to_index < 0) {
         context.try_error(
             diagnostic::ref::to_missing, d.get_source_span(),
-            u8"A \"to\" argument is required for a reference."
+            u8"A \"to\" argument is required for a reference."sv
         );
-        try_generate_error_html(out, d, context);
-        return;
+        return try_generate_error(out, d, context);
     }
 
     std::pmr::vector<char8_t> target { context.get_transient_memory() };
-    to_plaintext(target, d.get_arguments()[std::size_t(to_index)].get_content(), context);
+    const auto target_status
+        = to_plaintext(target, d.get_arguments()[std::size_t(to_index)].get_content(), context);
+    if (target_status != Content_Status::ok) {
+        return target_status;
+    }
     if (target.empty()) {
         context.try_error(
             diagnostic::ref::to_empty, d.get_source_span(),
-            u8"A \"to\" argument cannot have an empty value."
+            u8"A \"to\" argument cannot have an empty value."sv
         );
-        try_generate_error_html(out, d, context);
-        return;
+        return try_generate_error(out, d, context);
     }
+
+    try_enter_paragraph(out);
+
+    HTML_Writer writer { out };
 
     const auto target_string = as_u8string_view(target);
     const Reference_Classification classification = classify_reference(target_string);
     if (classification.type == Reference_Type::unknown) {
-        std::pmr::u8string section_name { context.get_transient_memory() };
-        section_name += section_name::bibliography;
-        section_name += u8'.';
-        section_name += target_string;
-        reference_section(out, section_name);
+        const std::u8string_view section_name_parts[] {
+            section_name::bibliography,
+            u8".",
+            target_string,
+        };
+        reference_section(out, joined_char_sequence(section_name_parts));
         if (d.get_content().empty()) {
-            out.write_inner_html(u8'[');
-            out.write_inner_text(target_string);
-            out.write_inner_html(u8']');
+            writer.write_inner_html(u8'[');
+            writer.write_inner_text(target_string);
+            writer.write_inner_html(u8']');
         }
-        out.write_inner_html(u8"</a>"); // no close_tag to avoid depth check
-        return;
+        writer.write_inner_html(u8"</a>"); // no close_tag to avoid depth check
+        return Content_Status::ok;
     }
 
     if (classification.type == Reference_Type::anchor) {
-        out.open_tag_with_attributes(u8"a") //
+        writer
+            .open_tag_with_attributes(u8"a") //
             .write_href(target_string)
             .end();
+        auto status = Content_Status::ok;
         if (d.get_content().empty()) {
-            std::pmr::u8string section_name { context.get_transient_memory() };
-            section_name += section_name::id_preview;
-            section_name += u8'.';
-            section_name += target_string.substr(1);
-            reference_section(out, section_name);
+            const std::u8string_view section_name_parts[] {
+                section_name::id_preview,
+                u8".",
+                target_string.substr(1),
+            };
+            reference_section(out, joined_char_sequence(section_name_parts));
         }
         else {
-            to_html(out, d.get_content(), context);
+            status = consume_all(out, d.get_content(), context);
         }
-        out.close_tag(u8"a");
-        return;
+        writer.close_tag(u8"a");
+        return status;
     }
 
     COWEL_ASSERT(classification.type == Reference_Type::url);
 
     if (!d.get_content().empty()) {
-        out.open_tag_with_attributes(u8"a") //
+        writer
+            .open_tag_with_attributes(u8"a") //
             .write_href(target_string)
             .end();
-        to_html(out, d.get_content(), context);
-        out.close_tag(u8"a");
-        return;
+        const auto status = consume_all(out, d.get_content(), context);
+        writer.close_tag(u8"a");
+        return status;
     }
 
-    Attribute_Writer attributes = out.open_tag_with_attributes(u8"a");
+    Attribute_Writer attributes = writer.open_tag_with_attributes(u8"a");
     attributes.write_href(target_string);
     const bool is_sans = classification.url_scheme == URL_Scheme::mailto
         || classification.url_scheme == URL_Scheme::tel
@@ -200,13 +217,13 @@ void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Cont
             if (url_scheme_is_web(classification.url_scheme) && text.starts_with(u8"//")) {
                 text.remove_prefix(2);
             }
-            out.write_inner_text(text);
+            writer.write_inner_text(text);
         }
         else {
-            out.write_inner_text(target_string);
+            writer.write_inner_text(target_string);
         }
-        out.close_tag(u8"a");
-        return;
+        writer.close_tag(u8"a");
+        return Content_Status::ok;
     }
 
     const std::size_t last_slash_pos = target_string.find_last_of(u8'/');
@@ -217,22 +234,22 @@ void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Cont
     auto consume_verbalized = [&](std::u8string_view part, Text_Format format) {
         switch (format) {
         case Text_Format::section:
-            out.write_inner_html(u8'[');
-            out.write_inner_text(part);
-            out.write_inner_html(u8']');
+            writer.write_inner_html(u8'[');
+            writer.write_inner_text(part);
+            writer.write_inner_html(u8']');
             break;
         case Text_Format::grammar:
-            out.open_tag(u8"g-term");
-            out.write_inner_text(part);
-            out.close_tag(u8"g-term");
+            writer.open_tag(u8"g-term");
+            writer.write_inner_text(part);
+            writer.close_tag(u8"g-term");
             break;
         case Text_Format::code:
-            out.open_tag(u8"tt-");
-            out.write_inner_text(part);
-            out.close_tag(u8"tt-");
+            writer.open_tag(u8"tt-");
+            writer.write_inner_text(part);
+            writer.close_tag(u8"tt-");
             break;
         default: //
-            out.write_inner_text(part);
+            writer.write_inner_text(part);
             break;
         }
     };
@@ -245,10 +262,13 @@ void Ref_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Cont
             last_uri_part,
             u8"\" could not be verbalized automatically.",
         };
-        context.try_warning(diagnostic::ref::draft_verbalization, d.get_source_span(), message);
-        out.write_inner_text(target_string);
+        context.try_warning(
+            diagnostic::ref::draft_verbalization, d.get_source_span(), joined_char_sequence(message)
+        );
+        writer.write_inner_text(target_string);
     }
-    out.close_tag(u8"a");
+    writer.close_tag(u8"a");
+    return Content_Status::ok;
 }
 
 } // namespace cowel

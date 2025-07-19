@@ -10,12 +10,12 @@
 #include <gtest/gtest.h>
 
 #include "cowel/diagnostic_highlight.hpp"
-#include "cowel/document_content_behavior.hpp"
+#include "cowel/policy/paragraph_split.hpp"
 #include "cowel/util/annotated_string.hpp"
 #include "cowel/util/assert.hpp"
+#include "cowel/util/meta.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
-#include "cowel/content_behavior.hpp"
 #include "cowel/diagnostic.hpp"
 #include "cowel/directive_behavior.hpp"
 #include "cowel/directive_processing.hpp"
@@ -33,46 +33,32 @@ namespace {
 
 using Suppress_Unused_Include_Annotated_String = Basic_Annotated_String<void, void>;
 
-struct Paragraphs_Behavior final : Content_Behavior {
-
-    void generate_plaintext(std::pmr::vector<char8_t>&, std::span<const ast::Content>, Context&)
-        const final
-    {
-        COWEL_ASSERT_UNREACHABLE(u8"Unimplemented, not needed.");
-    }
-
-    void generate_html(HTML_Writer& out, std::span<const ast::Content> content, Context& context)
-        const final
-    {
-        to_html(out, content, context, To_HTML_Mode::paragraphs);
-    }
-};
-
-struct Empty_Head_Behavior final : Head_Body_Content_Behavior {
-
-    void generate_head(HTML_Writer&, std::span<const ast::Content>, Context&) const final { }
-
-    void generate_body(HTML_Writer& out, std::span<const ast::Content> content, Context& context)
-        const final
-    {
-        to_html(out, content, context, To_HTML_Mode::paragraphs);
-    }
-};
-
 enum struct Test_Behavior : Default_Underlying {
     trivial,
     paragraphs,
     empty_head,
 };
 
+[[nodiscard]]
+Content_Status
+write_empty_head_document(Text_Sink& out, std::span<const ast::Content> content, Context& context)
+{
+    constexpr auto write_head = [](Content_Policy&, std::span<const ast::Content>, Context&) {
+        return Content_Status::ok;
+    };
+    constexpr auto write_body
+        = [](Content_Policy& policy, std::span<const ast::Content> content, Context& context) {
+              return consume_all(policy, content, context);
+          };
+
+    return write_head_body_document(out, content, context, const_v<write_head>, const_v<write_body>);
+}
+
 struct Doc_Gen_Test : testing::Test {
     std::pmr::monotonic_buffer_resource memory;
     std::pmr::vector<char8_t> out { &memory };
 
     Builtin_Directive_Set builtin_directives {};
-    Minimal_Content_Behavior minimal_behavior { builtin_directives.get_macro_behavior() };
-    Paragraphs_Behavior paragraphs_behavior {};
-    Empty_Head_Behavior empty_head_behavior {};
 
     std::filesystem::path file_path;
     std::pmr::vector<char8_t> source { &memory };
@@ -89,15 +75,38 @@ struct Doc_Gen_Test : testing::Test {
         COWEL_ASSERT(theme_loaded);
     }
 
+    template <Test_Behavior behavior>
     [[nodiscard]]
-    Content_Behavior& get_behavior(Test_Behavior behavior)
+    Function_Ref<Content_Status(Context&)> get_behavior_impl()
+    {
+        constexpr auto action = [](Doc_Gen_Test* self, Context& context) -> Content_Status {
+            Capturing_Ref_Text_Sink sink { self->out, Output_Language::html };
+            switch (behavior) {
+            case Test_Behavior::trivial: {
+                HTML_Content_Policy policy { sink };
+                return consume_all(policy, self->content, context);
+            }
+            case Test_Behavior::paragraphs: {
+                Paragraph_Split_Policy policy { sink, context.get_transient_memory() };
+                return consume_all(policy, self->content, context);
+            }
+            case Test_Behavior::empty_head: {
+                return write_empty_head_document(sink, self->content, context);
+            }
+            }
+        };
+        return Function_Ref<Content_Status(Context&)> { const_v<action>, this };
+    }
+
+    [[nodiscard]]
+    Function_Ref<Content_Status(Context&)> get_behavior(Test_Behavior behavior)
     {
         switch (behavior) {
-        case Test_Behavior::trivial: return minimal_behavior;
-        case Test_Behavior::paragraphs: return paragraphs_behavior;
-        case Test_Behavior::empty_head: return empty_head_behavior;
-        default: COWEL_ASSERT_UNREACHABLE(u8"Invalid test behavior.");
+        case Test_Behavior::trivial: return get_behavior_impl<Test_Behavior::trivial>();
+        case Test_Behavior::paragraphs: return get_behavior_impl<Test_Behavior::paragraphs>();
+        case Test_Behavior::empty_head: return get_behavior_impl<Test_Behavior::empty_head>();
         }
+        COWEL_ASSERT_UNREACHABLE(u8"Invalid behavior.");
     }
 
     [[nodiscard]]
@@ -130,31 +139,35 @@ struct Doc_Gen_Test : testing::Test {
         content = parse_and_build(source, File_Id {}, &memory, make_parse_error_consumer());
     }
 
-    std::u8string_view generate(Content_Behavior& root_behavior)
+    [[nodiscard]]
+    Content_Status generate(Test_Behavior behavior)
     {
         Directive_Behavior& error_behavior = builtin_directives.get_error_behavior();
-        const Generation_Options options { .output = out,
-                                           .root_behavior = root_behavior,
-                                           .root_content = content,
-                                           .builtin_behavior = builtin_directives,
+        const Generation_Options options { .builtin_behavior = builtin_directives,
                                            .error_behavior = &error_behavior,
                                            .highlight_theme_source = theme_source_string,
                                            .logger = logger,
                                            .highlighter = test_highlighter,
                                            .memory = &memory };
-        generate_document(options);
-        return { out.data(), out.size() };
+        const Function_Ref<Content_Status(Context&)> f = get_behavior(behavior);
+        return run_generation(f, options);
     }
 
+    [[nodiscard]]
+    std::u8string_view output_text() const
+    {
+        return as_u8string_view(out);
+    }
+
+    [[nodiscard]]
     Parse_Error_Consumer make_parse_error_consumer()
     {
-        constexpr auto invoker = [](void* entity, std::u8string_view id,
+        constexpr auto invoker = [](Doc_Gen_Test* self, std::u8string_view id,
                                     const File_Source_Span& location, std::u8string_view message) {
-            auto* const self = static_cast<Doc_Gen_Test*>(entity);
-            Diagnostic d { Severity::error, id, location, { &message, 1 } };
+            Diagnostic d { Severity::error, id, location, message };
             self->logger(d);
         };
-        return Parse_Error_Consumer { invoker, this };
+        return Parse_Error_Consumer { const_v<invoker>, this };
     }
 
     void clear()
@@ -170,16 +183,18 @@ TEST_F(Doc_Gen_Test, empty)
 {
     constexpr std::u8string_view expected;
     ASSERT_TRUE(load_document("empty.cow"));
-    const std::u8string_view actual = generate(minimal_behavior);
-    EXPECT_EQ(expected, actual);
+    const Content_Status status = generate(Test_Behavior::trivial);
+    EXPECT_EQ(status, Content_Status::ok);
+    EXPECT_EQ(expected, output_text());
 }
 
 TEST_F(Doc_Gen_Test, text)
 {
     constexpr std::u8string_view expected = u8"Hello, world!\n";
     ASSERT_TRUE(load_document("text.cow"));
-    const std::u8string_view actual = generate(minimal_behavior);
-    EXPECT_EQ(expected, actual);
+    const Content_Status status = generate(Test_Behavior::trivial);
+    EXPECT_EQ(status, Content_Status::ok);
+    EXPECT_EQ(expected, output_text());
 }
 
 TEST_F(Doc_Gen_Test, paragraphs)
@@ -190,8 +205,9 @@ a paragraph.
 <p>This is another paragraph.
 </p>)";
     ASSERT_TRUE(load_document("paragraphs.cow"));
-    const std::u8string_view actual = generate(paragraphs_behavior);
-    EXPECT_EQ(expected, actual);
+    const Content_Status status = generate(Test_Behavior::paragraphs);
+    EXPECT_EQ(status, Content_Status::ok);
+    EXPECT_EQ(expected, output_text());
 }
 
 struct Path {
@@ -205,6 +221,7 @@ struct Source {
 struct Basic_Test {
     std::variant<Path, Source> document;
     std::variant<Path, Source> expected_html;
+    Content_Status expected_status = Content_Status::ok;
     std::initializer_list<std::u8string_view> expected_diagnostics = {};
     Test_Behavior behavior = Test_Behavior::trivial;
 };
@@ -213,46 +230,68 @@ struct Basic_Test {
 constexpr Basic_Test basic_tests[] {
     { Source {u8"\\c{#x41}\\c{#x42}\\c{#x43}\n"},
       Source{ u8"&#x41;&#x42;&#x43;\n" } },
+
     { Source{ u8"\\c{#x00B6}\n" },
       Source { u8"&#x00B6;\n" } },
+
     { Source{ u8"\\c{}\n" },
       Source { u8"<error->\\c{}</error->\n" },
+      Content_Status::error,
       { diagnostic::c::blank } },
+
     { Source{ u8"\\c{ }\n" },
       Source { u8"<error->\\c{ }</error->\n" },
+      Content_Status::error,
       { diagnostic::c::blank } },
+
     { Source{ u8"\\c{#zzz}\n" },
       Source { u8"<error->\\c{#zzz}</error->\n" },
-    { diagnostic::c::digits } },
-      { Source{ u8"\\c{#xD800}\n" },
+      Content_Status::error,
+      { diagnostic::c::digits } },
+
+    { Source{ u8"\\c{#xD800}\n" },
       Source { u8"<error->\\c{#xD800}</error->\n" },
+      Content_Status::error,
       { diagnostic::c::nonscalar } },
     
     { Path { u8"U/ascii.cow" },
       Source { u8"ABC\n" } },
+
     { Source { u8"\\U{00B6}\n" },
       Source { u8"¶\n" } },
+
     { Source { u8"\\U{}\n" },
       Source { u8"<error->\\U{}</error->\n" },
+      Content_Status::error,
       { diagnostic::U::blank } },
+
     { Source { u8"\\U{ }\n" },
       Source { u8"<error->\\U{ }</error->\n" },
+      Content_Status::error,
       { diagnostic::U::blank } },
+
     { Source { u8"\\U{zzz}\n" },
       Source { u8"<error->\\U{zzz}</error->\n" },
+      Content_Status::error,
       { diagnostic::U::digits } },
+
     { Source { u8"\\U{D800}\n" },
       Source { u8"<error->\\U{D800}</error->\n" },
+      Content_Status::error,
       { diagnostic::U::nonscalar } },
 
     { Source { u8"\\h1{Heading}\n" },
       Source { u8"<h1 id=heading><a class=para href=#heading></a>Heading</h1>\n" } },
+
     { Source { u8"\\h1{\\code[x]{abcx}}\n" },
       Source { u8"<h1 id=abcx><a class=para href=#abcx></a><code>abc<h- data-h=kw>x</h-></code></h1>\n" } },
+
     { Source { u8"\\h2[listed=no]{ }\n" },
       Source { u8"<h2> </h2>\n" } },
+
     { Source { u8"\\h3[id=user id,listed=no]{Heading}\n" },
       Source { u8"<h3 id=\"user id\"><a class=para href=\"#user%20id\"></a>Heading</h3>\n" } },
+
     { Source { u8"\\h4[id=user-id,listed=no]{Heading}\n" },
       Source { u8"<h4 id=user-id><a class=para href=#user-id></a>Heading</h4>\n" } },
 
@@ -267,28 +306,39 @@ constexpr Basic_Test basic_tests[] {
 
     { Source { u8"\\code{}\n" },
       Source { u8"<code></code>\n" },
+      Content_Status::ok,
       { diagnostic::highlight_language } },
+
     { Source { u8"\\code[x]{}\n" },
       Source { u8"<code></code>\n" } },
+
     { Source { u8"\\code[x]{ }\n" },
       Source { u8"<code> </code>\n" } },
+
     { Source { u8"\\code[x]{xxx}\n" },
       Source { u8"<code><h- data-h=kw>xxx</h-></code>\n" } },
+
     { Source { u8"\\code[x]{xxx123}\n" },
       Source { u8"<code><h- data-h=kw>xxx</h->123</code>\n" } },
+
     { Source { u8"\\code[x]{ 123 }\n" },
       Source { u8"<code> 123 </code>\n" } },
+
     { Source { u8"\\code[x]{ \\b{123} }\n" },
       Source { u8"<code> <b>123</b> </code>\n" } },
+
     { Source { u8"\\code[x]{ \\b{xxx} }\n" },
       Source { u8"<code> <b><h- data-h=kw>xxx</h-></b> </code>\n" } },
+
     { Source { u8"\\code[x]{ \\b{x}xx }\n" },
       Source { u8"<code> <b><h- data-h=kw>x</h-></b><h- data-h=kw>xx</h-> </code>\n" } },
+
     { Path { u8"codeblock/trim.cow" },
       Path { u8"codeblock/trim.html" } },
 
     { Source { u8"\\hl[keyword]{awoo}\n" },
       Source { u8"<h- data-h=kw>awoo</h->\n" } },
+
     { Source { u8"\\code[c]{int \\hl[number]{x}}\n" },
       Source { u8"<code><h- data-h=kw_type>int</h-> <h- data-h=num>x</h-></code>\n" } },
 
@@ -300,13 +350,17 @@ constexpr Basic_Test basic_tests[] {
 
     { Source { u8"\\awoo\n" },
       Source { u8"<error->\\awoo</error->\n" },
+      Content_Status::error,
       { diagnostic::directive_lookup_unresolved } },
+
     { Source { u8"\\code[x]{\\awoo}\n" },
       Source { u8"<code><error->\\awoo</error-></code>\n" },
+      Content_Status::error,
       { diagnostic::directive_lookup_unresolved } },
 
     { Source { u8"" },
       Path { u8"document/empty.html" },
+      Content_Status::error,
       {},
       Test_Behavior::empty_head },
     
@@ -345,6 +399,35 @@ std::u8string_view load_basic_test_expectations(
     return std::get<Source>(test.expected_html).contents;
 }
 
+void append_specials_escaped(
+    Diagnostic_String& out,
+    std::u8string_view str,
+    Diagnostic_Highlight default_highlight
+)
+{
+    for (char8_t c : str) {
+        switch (c) {
+        case u8'\n': out.append(u8"\\n", Diagnostic_Highlight::escape); break;
+        case u8'\t': out.append(u8"\\t", Diagnostic_Highlight::escape); break;
+        default: out.append(c, default_highlight);
+        }
+    }
+}
+
+void append_test_details(Diagnostic_String& out, const Basic_Test& test)
+{
+    if (const auto* const source = std::get_if<Source>(&test.document)) {
+        out.append(u8'\"', Diagnostic_Highlight::code_citation);
+        append_specials_escaped(out, source->contents, Diagnostic_Highlight::code_citation);
+        out.append(u8'\"', Diagnostic_Highlight::code_citation);
+    }
+    else if (const auto* const path = std::get_if<Path>(&test.document)) {
+        out.append(path->value, Diagnostic_Highlight::code_position);
+    }
+    out.append(u8':', Diagnostic_Highlight::punctuation);
+    out.append(u8' ');
+}
+
 TEST_F(Doc_Gen_Test, basic_directive_tests)
 {
     for (const Basic_Test& test : basic_tests) {
@@ -364,22 +447,39 @@ TEST_F(Doc_Gen_Test, basic_directive_tests)
             continue;
         }
 
-        const std::u8string_view actual = generate(get_behavior(test.behavior));
-        if (expected != actual) {
+        const Content_Status status = generate(test.behavior);
+        if (status != test.expected_status) {
             Diagnostic_String error { &memory };
+            append_test_details(error, test);
+            error.build(Diagnostic_Highlight::error_text)
+                .append(u8"Test failed because the status (")
+                .append(status_name(status))
+                .append(u8") was not as expected (")
+                .append(status_name(test.expected_status))
+                .append(u8')');
+            error.append(u8'\n');
+            print_code_string_stdout(error);
+            flush_stdout();
+        }
+        EXPECT_TRUE(status == test.expected_status);
+        if (expected != output_text()) {
+            Diagnostic_String error { &memory };
+            append_test_details(error, test);
             error.append(
                 u8"Test failed because generated HTML does not match expected HTML.\n",
                 Diagnostic_Highlight::error_text
             );
-            print_lines_diff(error, actual, expected);
+            print_lines_diff(error, output_text(), expected);
             error.append(u8'\n');
             print_code_string_stdout(error);
+            flush_stdout();
         }
-        EXPECT_TRUE(expected == actual);
+        EXPECT_TRUE(expected == output_text());
 
         if (test.expected_diagnostics.size() == 0) {
             if (!logger.diagnostics.empty()) {
                 Diagnostic_String error { &memory };
+                append_test_details(error, test);
                 error.append(
                     u8"Test failed because an unexpected diagnostic was emitted:\n",
                     Diagnostic_Highlight::error_text
@@ -387,6 +487,7 @@ TEST_F(Doc_Gen_Test, basic_directive_tests)
                 error.append(logger.diagnostics.front().id);
                 error.append(u8"\n\n");
                 print_code_string_stdout(error);
+                flush_stdout();
             }
             EXPECT_TRUE(logger.diagnostics.empty());
             continue;

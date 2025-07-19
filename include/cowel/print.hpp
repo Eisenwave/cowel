@@ -82,6 +82,9 @@ std::ostream& print_code_string(std::ostream& out, const Diagnostic_String& stri
 
 void print_code_string_stdout(const Diagnostic_String&);
 void print_code_string_stderr(const Diagnostic_String&);
+void flush_stdout();
+void flush_stderr();
+
 #endif
 
 } // namespace cowel

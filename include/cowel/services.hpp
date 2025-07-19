@@ -212,13 +212,13 @@ public:
         return severity >= m_min_severity;
     }
 
-    constexpr virtual void operator()(const Diagnostic& diagnostic) = 0;
+    constexpr virtual void operator()(Diagnostic diagnostic) = 0;
 };
 
 struct Ignorant_Logger final : Logger {
     using Logger::Logger;
 
-    void operator()(const Diagnostic&) final { }
+    void operator()(Diagnostic) final { }
 };
 
 inline constinit Ignorant_Logger ignorant_logger { Severity::none };

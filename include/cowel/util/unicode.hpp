@@ -23,6 +23,18 @@ using ulight::utf8::is_valid;
 using ulight::utf8::sequence_length;
 using ulight::utf8::Unicode_Error;
 
+/// @brief Returns the length of `str`, in code units, when encoded.
+[[nodiscard]]
+constexpr std::size_t count_code_units_unchecked(std::u32string_view str)
+{
+    std::size_t result = 0;
+    for (const char32_t c : str) {
+        const auto [_, code_units] = utf8::encode8_unchecked(c);
+        result += std::size_t(code_units);
+    }
+    return result;
+}
+
 } // namespace cowel::utf8
 
 #endif

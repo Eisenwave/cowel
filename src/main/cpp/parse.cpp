@@ -8,7 +8,6 @@
 
 #include "cowel/util/assert.hpp"
 #include "cowel/util/chars.hpp"
-#include "cowel/util/unicode.hpp"
 
 #include "cowel/fwd.hpp"
 #include "cowel/parse.hpp"

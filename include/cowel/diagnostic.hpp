@@ -2,9 +2,9 @@
 #define COWEL_DIAGNOSTIC_HPP
 
 #include <compare>
-#include <span>
 #include <string_view>
 
+#include "cowel/util/char_sequence.hpp"
 #include "cowel/util/source_position.hpp"
 
 #include "cowel/fwd.hpp"
@@ -54,11 +54,11 @@ struct Diagnostic {
     /// @brief The id of the diagnostic,
     /// which is a non-empty string containing a
     /// dot-separated sequence of identifier for this diagnostic.
-    std::u8string_view id;
+    Char_Sequence8 id;
     /// @brief The span of code that is responsible for this diagnostic.
     File_Source_Span location;
     /// @brief The diagnostic message parts.
-    std::span<const std::u8string_view> message;
+    Char_Sequence8 message;
 };
 
 namespace diagnostic {

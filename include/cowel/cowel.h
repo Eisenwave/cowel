@@ -94,13 +94,9 @@ struct cowel_diagnostic {
     /// @brief The level of severity for this diagnostic.
     cowel_severity severity;
     /// @brief A unique identifier for the diagnostic.
-    /// The lifetime of this string is static.
     cowel_string_view id;
-    /// @brief An array containing all the parts of the message to be logged.
-    /// All strings within may become invalid immediately after the logger was invoked.
-    const cowel_string_view* message_parts;
-    /// @brief The length of the `message_parts` array.
-    size_t message_parts_size;
+    /// @brief The diagnostic message.
+    cowel_string_view message;
     /// @brief The name of the file in which the diagnostic occurred.
     /// This string may become invalid immediately after the logger was invoked.
     cowel_file_id file;
@@ -121,8 +117,7 @@ struct cowel_diagnostic {
 struct cowel_diagnostic_u8 {
     cowel_severity severity;
     cowel_string_view_u8 id;
-    const cowel_string_view_u8* message_parts;
-    size_t message_parts_size;
+    cowel_string_view_u8 message;
     cowel_file_id file;
     size_t begin;
     size_t length;

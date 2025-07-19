@@ -4,6 +4,7 @@
 #include <iterator>
 #include <string_view>
 
+#include "cowel/util/html.hpp"
 #include "ulight/impl/ascii_chars.hpp"
 #include "ulight/impl/chars.hpp"
 
@@ -98,6 +99,21 @@ void url_encode_ascii_if(Output out, std::u8string_view str, F filter)
         *out++ = u8'%';
         *out++ = detail::to_ascii_digit((c >> 4) & 0xf);
         *out++ = detail::to_ascii_digit((c >> 0) & 0xf);
+    }
+}
+
+template <string_or_char_consumer Output, typename F>
+    requires std::is_invocable_r_v<bool, F, char8_t>
+void url_encode_ascii_if(Output out, std::u8string_view str, F filter)
+{
+    for (char8_t c : str) {
+        if (!is_ascii(c) || !filter(c)) {
+            out(c);
+            continue;
+        }
+        out(u8'%');
+        out(detail::to_ascii_digit((c >> 4) & 0xf));
+        out(detail::to_ascii_digit((c >> 0) & 0xf));
     }
 }
 

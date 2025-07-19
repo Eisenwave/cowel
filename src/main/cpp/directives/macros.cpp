@@ -1,6 +1,8 @@
 #include <string_view>
 #include <vector>
 
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/from_chars.hpp"
 #include "cowel/util/strings.hpp"
 #include "cowel/util/to_chars.hpp"
@@ -8,33 +10,14 @@
 #include "cowel/ast.hpp"
 #include "cowel/builtin_directive_set.hpp"
 #include "cowel/context.hpp"
+#include "cowel/directive_arguments.hpp"
 #include "cowel/directive_processing.hpp"
 
+using namespace std::string_view_literals;
 namespace cowel {
 
-void Instantiated_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    std::pmr::vector<ast::Content> instantiation { context.get_transient_memory() };
-    instantiate(instantiation, d, context);
-    to_plaintext(out, instantiation, context);
-}
-
-void Instantiated_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    std::pmr::vector<ast::Content> instantiation { context.get_transient_memory() };
-    instantiate(instantiation, d, context);
-    to_html(out, instantiation, context);
-}
-
-void Macro_Define_Behavior::evaluate(const ast::Directive& d, Context& context) const
+Content_Status
+Macro_Define_Behavior::operator()(Content_Policy&, const ast::Directive& d, Context& context) const
 {
     static const std::u8string_view parameters[] { u8"pattern" };
     Argument_Matcher args { parameters, context.get_transient_memory() };
@@ -44,18 +27,18 @@ void Macro_Define_Behavior::evaluate(const ast::Directive& d, Context& context) 
     if (pattern_index < 0) {
         context.try_error(
             diagnostic::macro::no_pattern, d.get_source_span(),
-            u8"A directive pattern must be provided when defining a macro."
+            u8"A directive pattern must be provided when defining a macro."sv
         );
-        return;
+        return Content_Status::error;
     }
     const ast::Argument& pattern_arg = d.get_arguments()[std::size_t(pattern_index)];
     if (pattern_arg.get_content().size() != 1
         || !std::holds_alternative<ast::Directive>(pattern_arg.get_content()[0])) {
         context.try_error(
             diagnostic::macro::pattern_no_directive, pattern_arg.get_source_span(),
-            u8"The pattern in a macro definition has to be a single directive, nothing else."
+            u8"The pattern in a macro definition has to be a single directive, nothing else."sv
         );
-        return;
+        return Content_Status::error;
     }
 
     const auto& pattern_directive = std::get<ast::Directive>(pattern_arg.get_content()[0]);
@@ -72,8 +55,11 @@ void Macro_Define_Behavior::evaluate(const ast::Directive& d, Context& context) 
             pattern_name,
             u8"\".",
         };
-        context.try_soft_warning(diagnostic::macro::redefinition, d.get_source_span(), message);
+        context.try_soft_warning(
+            diagnostic::macro::redefinition, d.get_source_span(), joined_char_sequence(message)
+        );
     }
+    return Content_Status::ok;
 }
 
 namespace {
@@ -83,7 +69,8 @@ enum struct Put_Response : bool {
     abort,
 };
 
-void substitute_in_macro(
+[[nodiscard]]
+Content_Status substitute_in_macro(
     std::pmr::vector<ast::Content>& content,
     const std::span<const ast::Argument> provided_arguments,
     const std::span<const ast::Content> provided_content,
@@ -111,9 +98,12 @@ void substitute_in_macro(
             // run substitution on, recursively.
             if (arg_content.size() != 1
                 || !std::holds_alternative<ast::Directive>(arg_content.front())) {
-                substitute_in_macro(
+                const auto status = substitute_in_macro(
                     arg_content, provided_arguments, provided_content, context, on_variadic_put
                 );
+                if (status_is_break(status)) {
+                    return status;
+                }
                 ++arg_it;
                 continue;
             }
@@ -132,17 +122,23 @@ void substitute_in_macro(
                 variadically_expanded = true;
                 return Put_Response::abort;
             };
-            substitute_in_macro(
+            const auto status = substitute_in_macro(
                 arg_content, provided_arguments, provided_content, context, variadic_put_expand
             );
+            if (status_is_break(status)) {
+                return status;
+            }
             if (!variadically_expanded) {
                 ++arg_it;
             }
         }
 
-        substitute_in_macro(
+        const auto status0 = substitute_in_macro(
             d->get_content(), provided_arguments, provided_content, context, on_variadic_put
         );
+        if (status_is_break(status0)) {
+            return status0;
+        }
 
         if (d->get_name() != u8"put") {
             ++it;
@@ -155,7 +151,11 @@ void substitute_in_macro(
         );
 
         std::pmr::vector<char8_t> selection { context.get_transient_memory() };
-        to_plaintext(selection, d->get_content(), context);
+        const auto status1 = to_plaintext(selection, d->get_content(), context);
+        if (status_is_break(status1)) {
+            return status1;
+        }
+
         const auto selection_string = trim_ascii_blank(as_u8string_view(selection));
 
         const auto substitute_arg = [&](const ast::Argument& arg) {
@@ -183,7 +183,7 @@ void substitute_in_macro(
             const File_Source_Span location = d->get_source_span();
             it = content.erase(it);
             if (on_variadic_put(location) == Put_Response::abort) {
-                return;
+                return Content_Status::ok;
             }
             continue;
         }
@@ -194,7 +194,7 @@ void substitute_in_macro(
         if (!arg_index) {
             context.try_error(
                 diagnostic::macro::put_invalid, d->get_source_span(),
-                u8"The argument to this \\put pseudo-directive is invalid."
+                u8"The argument to this \\put pseudo-directive is invalid."sv
             );
             it = content.erase(it);
             continue;
@@ -214,7 +214,8 @@ void substitute_in_macro(
                     u8"\\put[else=xyz]{0}."
                 };
                 context.try_error(
-                    diagnostic::macro::put_out_of_range, d->get_source_span(), message
+                    diagnostic::macro::put_out_of_range, d->get_source_span(),
+                    joined_char_sequence(message)
                 );
                 it = content.erase(it);
                 continue;
@@ -229,9 +230,11 @@ void substitute_in_macro(
         it = content.erase(it);
         substitute_arg(provided_arguments[*arg_index]);
     }
+    return Content_Status::ok;
 }
 
-void instantiate_macro(
+[[nodiscard]]
+Content_Status instantiate_macro(
     std::pmr::vector<ast::Content>& out,
     const ast::Directive& definition,
     std::span<const ast::Argument> put_arguments,
@@ -246,17 +249,17 @@ void instantiate_macro(
         context.try_error(
             diagnostic::macro::put_args_outside_args, location,
             u8"A \\put[...] pseudo-directive can only be used as the sole positional argument "
-            u8"in a directive."
+            u8"in a directive."sv
         );
         return Put_Response::normal;
     };
-    substitute_in_macro(out, put_arguments, put_content, context, on_variadic_put);
+    return substitute_in_macro(out, put_arguments, put_content, context, on_variadic_put);
 }
 
 } // namespace
 
-void Macro_Instantiate_Behavior::instantiate(
-    std::pmr::vector<ast::Content>& out,
+Content_Status Macro_Instantiate_Behavior::operator()(
+    Content_Policy& out,
     const ast::Directive& d,
     Context& context
 ) const
@@ -267,7 +270,13 @@ void Macro_Instantiate_Behavior::instantiate(
     // so we're effectively calling it twice with the same input.
     COWEL_ASSERT(definition);
 
-    instantiate_macro(out, *definition, d.get_arguments(), d.get_content(), context);
+    std::pmr::vector<ast::Content> instance { context.get_transient_memory() };
+    const auto status
+        = instantiate_macro(instance, *definition, d.get_arguments(), d.get_content(), context);
+    if (status_is_break(status)) {
+        return status;
+    }
+    return consume_all(out, instance, context);
 }
 
 } // namespace cowel

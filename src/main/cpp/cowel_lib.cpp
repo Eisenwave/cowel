@@ -8,7 +8,6 @@
 #include "cowel/assets.hpp"
 #include "cowel/builtin_directive_set.hpp"
 #include "cowel/cowel.h"
-#include "cowel/document_content_behavior.hpp"
 #include "cowel/document_generation.hpp"
 #include "cowel/parse.hpp"
 #include "cowel/services.hpp"
@@ -18,6 +17,8 @@ namespace cowel {
 namespace {
 
 static_assert(std::is_same_v<cowel::File_Id, cowel_file_id>);
+
+using cowel::as_u8string_view;
 
 [[nodiscard]]
 std::u8string_view as_u8string_view(cowel_string_view_u8 str)
@@ -188,7 +189,7 @@ struct Logger_From_Options final : Logger {
 private:
     cowel_log_fn_u8* m_log;
     void* m_log_data;
-    std::pmr::vector<cowel_string_view_u8> m_message_parts;
+    std::pmr::vector<char8_t> m_buffer;
 
 public:
     explicit Logger_From_Options(
@@ -200,7 +201,7 @@ public:
         : Logger { Severity(min_severity) }
         , m_log { log }
         , m_log_data { log_data }
-        , m_message_parts { memory }
+        , m_buffer { memory }
     {
     }
 
@@ -209,22 +210,31 @@ public:
     {
     }
 
-    void operator()(const Diagnostic& diagnostic) final
+    void operator()(Diagnostic diagnostic) final
     {
         if (!m_log) {
             return;
         }
-        COWEL_ASSERT(m_message_parts.empty());
-        m_message_parts.reserve(diagnostic.message.size());
-        for (const std::u8string_view& part : diagnostic.message) {
-            m_message_parts.push_back(as_cowel_string_view(part));
-        }
+        COWEL_ASSERT(m_buffer.empty());
+
+        /// If `chars` is contiguous, simply returns the underlying `u8string_view`.
+        /// Otherwise, spills the contents of `chars` into `m_buffer`.
+        const auto char_sequence_to_sv = [&](Char_Sequence8 chars) -> cowel_string_view_u8 {
+            std::u8string_view result = chars.as_string_view();
+            if (chars.empty() || !result.empty()) {
+                return { result.data(), result.size() };
+            }
+            const std::size_t initial_size = m_buffer.size();
+            m_buffer.resize(initial_size + chars.size());
+            chars.extract(std::span { m_buffer }.subspan(initial_size));
+            COWEL_ASSERT(chars.empty());
+            return as_cowel_string_view(as_u8string_view(m_buffer).substr(initial_size));
+        };
 
         const cowel_diagnostic_u8 diagnostic_u8 {
             .severity = cowel_severity(diagnostic.severity),
-            .id = as_cowel_string_view(diagnostic.id),
-            .message_parts = m_message_parts.data(),
-            .message_parts_size = m_message_parts.size(),
+            .id = char_sequence_to_sv(diagnostic.id),
+            .message = char_sequence_to_sv(diagnostic.message),
             .file = diagnostic.location.file,
             .begin = diagnostic.location.begin,
             .length = diagnostic.location.length,
@@ -232,7 +242,7 @@ public:
             .column = diagnostic.location.column,
         };
         m_log(m_log_data, &diagnostic_u8);
-        m_message_parts.clear();
+        m_buffer.clear();
     }
 };
 
@@ -253,13 +263,10 @@ cowel_mutable_string_view_u8 do_generate_html(const cowel_options_u8& options)
     // have been performed using that.
     alignas(output_type) std::byte output_storage[sizeof(output_type)];
     output_type& output = *new (output_storage) output_type { memory };
+    Capturing_Ref_Text_Sink html_sink { output, Output_Language::html };
+    HTML_Content_Policy html_policy { html_sink };
 
     Builtin_Directive_Set builtin_behavior {};
-    Document_Content_Behavior document_behavior { builtin_behavior.get_macro_behavior() };
-    Minimal_Content_Behavior minimal_behavior { builtin_behavior.get_macro_behavior() };
-    Content_Behavior& root_behavior = options.mode == COWEL_MODE_MINIMAL
-        ? static_cast<Content_Behavior&>(minimal_behavior)
-        : static_cast<Content_Behavior&>(document_behavior);
 
     File_Loader_From_Options file_loader { options.load_file, options.load_file_data };
     Logger_From_Options logger { options, memory };
@@ -270,7 +277,7 @@ cowel_mutable_string_view_u8 do_generate_html(const cowel_options_u8& options)
     const std::pmr::vector<ast::Content> root_content = parse_and_build(
         source, File_Id {}, memory,
         [&](std::u8string_view id, File_Source_Span pos, std::u8string_view message) {
-            logger(Diagnostic { Severity::error, id, pos, { &message, 1 } });
+            logger(Diagnostic { Severity::error, id, pos, message });
         }
     );
 
@@ -278,10 +285,7 @@ cowel_mutable_string_view_u8 do_generate_html(const cowel_options_u8& options)
         ? assets::wg21_json
         : as_u8string_view(options.highlight_theme_json);
 
-    const Generation_Options gen_options { .output = output,
-                                           .root_behavior = root_behavior,
-                                           .root_content = root_content,
-                                           .builtin_behavior = builtin_behavior,
+    const Generation_Options gen_options { .builtin_behavior = builtin_behavior,
                                            .error_behavior = &builtin_behavior.get_error_behavior(),
                                            .highlight_theme_source = highlight_theme_source,
                                            .file_loader = file_loader,
@@ -289,7 +293,19 @@ cowel_mutable_string_view_u8 do_generate_html(const cowel_options_u8& options)
                                            .highlighter = highlighter,
                                            .memory = memory };
 
-    generate_document(gen_options);
+    [[maybe_unused]]
+    // FIXME: use the content status somehow
+    const Content_Status status
+        = run_generation(
+            [&](Context& context) -> Content_Status {
+                if (options.mode == COWEL_MODE_MINIMAL) {
+                    return consume_all(html_policy, root_content, context);
+                }
+                COWEL_ASSERT(options.mode == COWEL_MODE_DOCUMENT);
+                return write_wg21_document(html_policy, root_content, context);
+            },
+            gen_options
+        );
 
     // This is safe because output is never destroyed,
     // so we keep its allocation alive.
@@ -303,13 +319,12 @@ void uncaught_exception(const cowel_options& options)
         std::terminate();
     }
     constexpr std::string_view message = "Uncaught exception.";
-    constexpr cowel_string_view cowel_message { message.data(), message.size() };
+    constexpr std::string_view id = "exception";
 
     const cowel_diagnostic diagnostic {
         .severity = COWEL_SEVERITY_MAX,
-        .id = { "exception", sizeof("exception") - 1 },
-        .message_parts = &cowel_message,
-        .message_parts_size = 1,
+        .id = { id.data(), id.size() },
+        .message = { message.data(), message.size() },
         .file = 0,
         .begin = 0,
         .length = 0,
@@ -327,13 +342,12 @@ void uncaught_exception_u8(const cowel_options_u8& options)
         std::terminate();
     }
     constexpr std::u8string_view message = u8"Uncaught exception.";
-    constexpr cowel_string_view_u8 cowel_message { message.data(), message.size() };
+    constexpr std::u8string_view id = u8"exception";
 
     const cowel_diagnostic_u8 diagnostic {
         .severity = COWEL_SEVERITY_MAX,
-        .id = { u8"exception", sizeof(u8"exception") - 1 },
-        .message_parts = &cowel_message,
-        .message_parts_size = 1,
+        .id = { id.data(), id.size() },
+        .message = { message.data(), message.size() },
         .file = 0,
         .begin = 0,
         .length = 0,

@@ -3,129 +3,103 @@
 
 #include "cowel/util/strings.hpp"
 
+#include "cowel/policy/html.hpp"
+#include "cowel/policy/paragraph_split.hpp"
+#include "cowel/policy/plaintext.hpp"
+
 #include "cowel/builtin_directive_set.hpp"
 #include "cowel/directive_processing.hpp"
 
+using namespace std::string_view_literals;
+
 namespace cowel {
 
-void HTML_Wrapper_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    to_plaintext(out, d.get_content(), context);
-}
-
-void HTML_Wrapper_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    to_html(out, d.get_content(), context, m_to_html_mode);
-}
-
-void Plaintext_Wrapper_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    to_plaintext(out, d.get_content(), context);
-}
-
-void Trim_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    to_plaintext(out, d.get_content(), context, To_Plaintext_Mode::trimmed);
-}
-
-void Trim_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
-{
-    to_html(out, d.get_content(), context, To_HTML_Mode::trimmed);
-}
-
-void Passthrough_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    switch (category) {
-    case Directive_Category::formatting:
-    case Directive_Category::pure_plaintext:
-    case Directive_Category::mixed: {
-        to_plaintext(out, d.get_content(), context);
-        break;
-    }
-    case Directive_Category::pure_html: {
-        break;
-    }
-    case Directive_Category::meta:
-    case Directive_Category::macro: {
-        COWEL_ASSERT_UNREACHABLE(u8"Passthrough_Behavior should not be meta or macro.");
-    }
-    }
-}
-
-void Passthrough_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    const std::u8string_view name = get_name(d);
-    if (d.get_arguments().empty()) {
-        out.open_tag(name);
-    }
-    else {
-        Attribute_Writer attributes = out.open_tag_with_attributes(name);
-        named_arguments_to_attributes(attributes, d, context);
-        attributes.end();
-        warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
-    }
-    to_html(out, d.get_content(), context);
-    out.close_tag(name);
-}
-
-void In_Tag_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
-{
-    switch (category) {
-    case Directive_Category::formatting:
-    case Directive_Category::pure_plaintext:
-    case Directive_Category::mixed: {
-        to_plaintext(out, d.get_content(), context);
-        break;
-    }
-    case Directive_Category::pure_html: {
-        break;
-    }
-    case Directive_Category::meta:
-    case Directive_Category::macro: {
-        COWEL_ASSERT_UNREACHABLE(u8"In_Tag_Behavior should not be meta or macro.");
-    }
-    }
-}
-
-void In_Tag_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context)
+Content_Status
+HTML_Wrapper_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context)
     const
 {
-    Attribute_Writer attributes = out.open_tag_with_attributes(m_tag_name);
-    named_arguments_to_attributes(attributes, d, context);
-    attributes.write_class(m_class_name);
-    attributes.end();
+    // TODO: warn about unused arguments
+    ensure_paragraph_matches_display(out, m_display);
+
+    Paragraph_Split_Policy split_policy { out, context.get_transient_memory() };
+    auto& policy = m_is_paragraphed ? split_policy : out;
+
+    return consume_all(policy, d.get_content(), context);
+}
+
+Content_Status Plaintext_Wrapper_Behavior::operator()(
+    Content_Policy& out,
+    const ast::Directive& d,
+    Context& context
+) const
+{
+    // TODO: warn about unused arguments
+    ensure_paragraph_matches_display(out, m_display);
+
+    Plaintext_Content_Policy policy { out };
+    return consume_all(policy, d.get_content(), context);
+}
+
+Content_Status
+Trim_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
+{
+    // TODO: warn about unused arguments
+    ensure_paragraph_matches_display(out, m_display);
+
+    return consume_all_trimmed(out, d.get_content(), context);
+}
+
+Content_Status
+Passthrough_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context)
+    const
+{
     warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
 
-    to_html(out, d.get_content(), context);
-    out.close_tag(m_tag_name);
+    ensure_paragraph_matches_display(out, m_display);
+
+    HTML_Content_Policy html_policy { out };
+    auto& policy = m_policy == Policy_Usage::html ? html_policy : out;
+
+    const std::u8string_view name = get_name(d);
+    HTML_Writer writer { policy };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(name);
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
+    attributes.end();
+    if (status_is_break(attributes_status)) {
+        writer.close_tag(name);
+        return attributes_status;
+    }
+
+    const auto content_status = consume_all(policy, d.get_content(), context);
+    writer.close_tag(name);
+    return status_concat(attributes_status, content_status);
+}
+
+// TODO: Passthrough_Behavior and In_Tag_Behavior are virtually identical.
+//       It would be better to merge them into one.
+Content_Status
+In_Tag_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
+{
+    warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
+
+    ensure_paragraph_matches_display(out, m_display);
+
+    HTML_Content_Policy html_policy { out };
+    auto& policy = m_policy == Policy_Usage::html ? html_policy : out;
+
+    HTML_Writer writer { policy };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(m_tag_name);
+    attributes.write_class(m_class_name);
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
+    attributes.end();
+    if (status_is_break(attributes_status)) {
+        writer.close_tag(m_tag_name);
+        return attributes_status;
+    }
+
+    const auto content_status = consume_all(policy, d.get_content(), context);
+    writer.close_tag(m_tag_name);
+    return status_concat(attributes_status, content_status);
 }
 
 [[nodiscard]]
@@ -137,96 +111,131 @@ std::u8string_view Directive_Name_Passthrough_Behavior::get_name(const ast::Dire
     return name.substr(m_name_prefix.size());
 }
 
-void Special_Block_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    Context& context
-) const
+Content_Status
+Special_Block_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context)
+    const
 {
-    Attribute_Writer attributes = out.open_tag_with_attributes(m_name);
-    named_arguments_to_attributes(attributes, d, context);
     warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
-    attributes.end();
 
-    auto initial_state = Paragraphs_State::outside;
-    if (m_emit_intro) {
-        initial_state = Paragraphs_State::inside;
-        out.open_tag(u8"p");
-        out.open_and_close_tag(u8"intro-");
+    const bool emit_intro = m_intro == Intro_Policy::yes;
+    const auto initial_state = emit_intro ? Paragraphs_State::inside : Paragraphs_State::outside;
+
+    HTML_Content_Policy html_policy { out };
+    Paragraph_Split_Policy policy { html_policy, context.get_transient_memory(), initial_state };
+    HTML_Writer writer { policy };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(m_name);
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
+    attributes.end();
+    if (status_is_break(attributes_status)) {
+        writer.close_tag(m_name);
+        return attributes_status;
+    }
+
+    if (emit_intro) {
+        writer.open_tag(u8"p");
+        writer.open_and_close_tag(u8"intro-");
         // This space ensures that even if the user writes say,
         // \note{abc}, there is a space between </into> and abc.
-        out.write_inner_html(u8' ');
+        writer.write_inner_html(u8' ');
     }
-    to_html(out, d.get_content(), context, To_HTML_Mode::paragraphs, initial_state);
-    out.close_tag(m_name);
+    // TODO: add paragraph splitting content policy here
+    const auto content_status = consume_all(policy, d.get_content(), context);
+    policy.leave_paragraph();
+    writer.close_tag(m_name);
+    return status_concat(attributes_status, content_status);
 }
 
-void URL_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
+Content_Status
+URL_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
+    // TODO: warn about unused arguments
+
+    try_enter_paragraph(out);
+
     std::pmr::vector<char8_t> url { context.get_transient_memory() };
     append(url, m_url_prefix);
-    to_plaintext(url, d.get_content(), context);
+    const auto text_status = to_plaintext(url, d.get_content(), context);
+    if (text_status != Content_Status::ok) {
+        return text_status;
+    }
+
     const auto url_string = as_u8string_view(url);
 
-    Attribute_Writer attributes = out.open_tag_with_attributes(u8"a");
-    named_arguments_to_attributes(attributes, d, context);
+    HTML_Writer writer { out };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(u8"a");
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
     attributes.write_href(url_string);
     attributes.write_class(u8"sans");
     attributes.end();
     warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
 
     COWEL_ASSERT(url_string.length() >= m_url_prefix.length());
-    out.write_inner_text(url_string.substr(m_url_prefix.length()));
+    writer.write_inner_text(url_string.substr(m_url_prefix.length()));
 
-    out.close_tag(u8"a");
+    writer.close_tag(u8"a");
+    return attributes_status;
 }
 
-void Self_Closing_Behavior::generate_html(
-    HTML_Writer& out,
-    const ast::Directive& d,
-    Context& context
-) const
+Content_Status
+Self_Closing_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context)
+    const
 {
+    warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
+
+    // TODO: this should use some utility function
     if (!d.get_content().empty()) {
         const auto location = ast::get_source_span(d.get_content().front());
         context.try_warning(
             diagnostic::ignored_content, location,
             u8"Content was ignored. Use empty braces,"
-            "i.e. {} to resolve this warning."
+            "i.e. {} to resolve this warning."sv
         );
     }
 
-    Attribute_Writer attributes = out.open_tag_with_attributes(m_tag_name);
-    named_arguments_to_attributes(attributes, d, context);
+    ensure_paragraph_matches_display(out, m_display);
+
+    HTML_Writer writer { out };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(m_tag_name);
+    const auto status = named_arguments_to_attributes(attributes, d, context);
     attributes.end_empty();
-    warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
+    return status;
 }
 
-void List_Behavior::generate_html(HTML_Writer& out, const ast::Directive& d, Context& context) const
+Content_Status
+List_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
-    Attribute_Writer attributes = out.open_tag_with_attributes(m_tag_name);
-    named_arguments_to_attributes(attributes, d, context);
-    attributes.end();
     warn_ignored_argument_subset(d.get_arguments(), context, Argument_Subset::positional);
 
-    for (const ast::Content& c : d.get_content()) {
+    try_leave_paragraph(out);
+
+    HTML_Content_Policy policy { out };
+    HTML_Writer writer { policy };
+    Attribute_Writer attributes = writer.open_tag_with_attributes(m_tag_name);
+    const auto attributes_status = named_arguments_to_attributes(attributes, d, context);
+    attributes.end();
+    if (status_is_break(attributes_status)) {
+        return attributes_status;
+    }
+
+    const auto content_status = process_greedy(d.get_content(), [&](const ast::Content& c) {
         if (const auto* const directive = std::get_if<ast::Directive>(&c)) {
             const std::u8string_view name = directive->get_name();
-            if (name == u8"item" || name == u8"-item") {
-                context.try_warning(
-                    diagnostic::deprecated, directive->get_name_span(),
-                    u8"Use of \\item is deprecated. Use \\li in lists instead."
-                );
-                m_item_behavior.generate_html(out, *directive, context);
-            }
-            else {
-                to_html(out, *directive, context);
-            }
-            continue;
+            return [&] {
+                if (name == u8"item" || name == u8"-item") {
+                    context.try_warning(
+                        diagnostic::deprecated, directive->get_name_span(),
+                        u8"Use of \\item is deprecated. Use \\li in lists instead."sv
+                    );
+                    return m_item_behavior(policy, *directive, context);
+                }
+                return policy.consume(*directive, context);
+            }();
         }
-        to_html(out, c, context);
-    }
-    out.close_tag(m_tag_name);
+        return policy.consume_content(c, context);
+    });
+
+    writer.close_tag(m_tag_name);
+    return status_concat(attributes_status, content_status);
 }
 
 } // namespace cowel

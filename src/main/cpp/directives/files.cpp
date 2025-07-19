@@ -1,14 +1,18 @@
 #include <string_view>
 #include <vector>
 
-#include "cowel/parse.hpp"
+#include "cowel/util/char_sequence.hpp"
+#include "cowel/util/char_sequence_factory.hpp"
 #include "cowel/util/strings.hpp"
 
 #include "cowel/builtin_directive_set.hpp"
 #include "cowel/context.hpp"
 #include "cowel/diagnostic.hpp"
 #include "cowel/directive_processing.hpp"
+#include "cowel/parse.hpp"
 #include "cowel/services.hpp"
+
+using namespace std::string_view_literals;
 
 namespace cowel {
 namespace {
@@ -29,21 +33,27 @@ std::u8string_view file_load_error_explanation(File_Load_Error error)
 
 } // namespace
 
-void Include_Behavior::generate_plaintext(
-    std::pmr::vector<char8_t>& out,
-    const ast::Directive& d,
-    Context& context
-) const
+Content_Status
+Include_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
+    // TODO: warn about ignored arguments
+
     std::pmr::vector<char8_t> path_data { context.get_transient_memory() };
-    to_plaintext(path_data, d.get_content(), context);
+    const auto path_status = to_plaintext(path_data, d.get_content(), context);
+    switch (path_status) {
+    case Content_Status::ok: break;
+    case Content_Status::abandon: return Content_Status::abandon;
+    case Content_Status::error:
+    case Content_Status::error_abandon:
+    case Content_Status::fatal: return Content_Status::fatal;
+    }
 
     if (path_data.empty()) {
         context.try_error(
             diagnostic::include::path_missing, d.get_source_span(),
-            u8"The given path to include text data from cannot empty."
+            u8"The given path to include text data from cannot empty."sv
         );
-        return;
+        return Content_Status::fatal;
     }
 
     const auto path_string = as_u8string_view(path_data);
@@ -54,26 +64,36 @@ void Include_Behavior::generate_plaintext(
             file_load_error_explanation(entry.error()),
             u8" Note that files are loaded relative to the directory of the current document."
         };
-        context.try_error(diagnostic::include::io, d.get_source_span(), message);
+        context.try_error(
+            diagnostic::include::io, d.get_source_span(), joined_char_sequence(message)
+        );
+        return Content_Status::fatal;
     }
-    append(out, entry->source);
+    out.write(entry->source, Output_Language::text);
+    return Content_Status::ok;
 }
 
-void Import_Behavior::instantiate(
-    std::pmr::vector<ast::Content>& out,
-    const ast::Directive& d,
-    Context& context
-) const
+Content_Status
+Import_Behavior::operator()(Content_Policy& out, const ast::Directive& d, Context& context) const
 {
+    // TODO: warn about ignored arguments
+
     std::pmr::vector<char8_t> path_data { context.get_transient_memory() };
-    to_plaintext(path_data, d.get_content(), context);
+    const auto path_status = to_plaintext(path_data, d.get_content(), context);
+    switch (path_status) {
+    case Content_Status::ok: break;
+    case Content_Status::abandon: return Content_Status::abandon;
+    case Content_Status::error:
+    case Content_Status::error_abandon:
+    case Content_Status::fatal: return Content_Status::fatal;
+    }
 
     if (path_data.empty()) {
         context.try_error(
             diagnostic::import::path_missing, d.get_source_span(),
-            u8"The given path to include text data from cannot empty."
+            u8"The given path to include text data from cannot empty."sv
         );
-        return;
+        return Content_Status::fatal;
     }
 
     const Result<File_Entry, File_Load_Error> entry
@@ -84,8 +104,10 @@ void Import_Behavior::instantiate(
             file_load_error_explanation(entry.error()),
             u8" Note that files are loaded relative to the directory of the current document."
         };
-        context.try_error(diagnostic::import::io, d.get_source_span(), message);
-        return;
+        context.try_error(
+            diagnostic::import::io, d.get_source_span(), joined_char_sequence(message)
+        );
+        return Content_Status::fatal;
     }
 
     auto on_error
@@ -95,10 +117,12 @@ void Import_Behavior::instantiate(
                   return;
               }
               const File_Source_Span file_location { location, entry->id };
-              const std::span<const std::u8string_view> message_parts { &message, 1 };
-              context.emit(Diagnostic { severity, id, file_location, message_parts });
+              context.emit(severity, id, file_location, message);
           };
-    parse_and_build(out, entry->source, entry->id, context.get_transient_memory(), on_error);
+
+    const std::pmr::vector<ast::Content> imported_content
+        = parse_and_build(entry->source, entry->id, context.get_transient_memory(), on_error);
+    return consume_all(out, imported_content, context);
 }
 
 } // namespace cowel
